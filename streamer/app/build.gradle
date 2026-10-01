@@ -3,6 +3,14 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
+// Shared version, read from the repo root. versionCode must increase monotonically for
+// Android, so it is derived from the semantic version: major*10000 + minor*100 + patch.
+def exmVersion = new File(rootProject.projectDir, "../VERSION").text.trim()
+def exmVersionCode = {
+    def parts = exmVersion.tokenize('.')
+    parts[0].toInteger() * 10000 + parts[1].toInteger() * 100 + parts[2].toInteger()
+}()
+
 android {
     namespace 'com.exmachina.epoccamstreamer'
     compileSdk 33
@@ -11,8 +19,11 @@ android {
         applicationId "com.exmachina.epoccamstreamer"
         minSdk 23
         targetSdk 33
-        versionCode 5
-        versionName "2.4.1"
+        // Single source of truth for both apps: ../VERSION at the repo root. The streamer
+        // and the viewer must be released as a matched pair — the wire protocol between them
+        // changes with almost every feature — so neither carries a version of its own.
+        versionCode exmVersionCode
+        versionName exmVersion
     }
 
     buildTypes {

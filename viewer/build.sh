@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 PROJ="$(cd "$(dirname "$0")" && pwd)"
+# Shared version, read from the repo root — see streamer/app/build.gradle for the rationale.
+VERSION="$(cat "$PROJ/../VERSION" | tr -d '[:space:]')"
 SDK=$(xcrun --show-sdk-path)
 MIN=11.0
 BUILD="$PROJ/.build"
@@ -118,6 +120,11 @@ lipo -create \
 
 echo "==> Copying Info.plist"
 cp "$PROJ/Resources/Info.plist" "$APP/Contents/Info.plist"
+# Info.plist is a template: the version in it is a placeholder, stamped here so the bundle
+# can never disagree with VERSION.
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
+echo "==> Version $VERSION"
 cp "$PROJ/Resources/AppIcon.icns" "$RES/"
 
 echo ""
