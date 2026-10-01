@@ -1,0 +1,202 @@
+package com.exmachina.epoccamstreamer
+
+import java.lang.Float.floatToIntBits
+
+object Protocol {
+
+    // Find the next H264 Annex-B start code (0x00 0x00 0x01) starting at offset.
+    // Returns the index of the 0x01 byte, or -1 if not found.
+    fun findStartCode(buf: ByteArray, offset: Int, limit: Int): Int {
+        var i = offset
+        while (i < limit - 2) {
+            if (buf[i] == 0.toByte() && buf[i + 1] == 0.toByte() && buf[i + 2] == 1.toByte()) {
+                return i
+            }
+            i++
+        }
+        return -1
+    }
+
+    // Build the 28-byte packet header (all fields little-endian).
+    // Layout (confirmed from u.smali + pcap analysis):
+    //   [0-3]   0xDEADC0DE magic
+    //   [4-7]   0x00000000 (iPhone uses 0 here; original Android used 0xDEADC0DE)
+    //   [8-11]  0x00020002 type (video)
+    //   [12-15] nalSize + 12
+    //   [16-19] camera orientation flags: 0 = back camera (no mirror), 0x10 = front camera (mirror)
+    //           The viewer uses this to apply horizontal flip. Must NOT be the frame counter.
+    //   [20-23] timestamp ms (0xFFFFFFFF = display immediately, no viewer buffering — iPhone protocol)
+    //   [24-27] nalSize
+    fun buildHeader(nalSize: Int, timestampMs: Long, cameraFlags: Int = 0): ByteArray {
+        val h = ByteArray(28)
+        putLE32(h, 0, 0xDEADC0DE.toInt())
+        putLE32(h, 4, 0x00000000)
+        putLE32(h, 8, 0x00020002)
+        putLE32(h, 12, nalSize + 12)
+        putLE32(h, 16, cameraFlags)
+        putLE32(h, 20, timestampMs.toInt())
+        putLE32(h, 24, nalSize)
+        return h
+    }
+
+    // Special header for the SPS+PPS config packet: cameraFlags=8, timestamp=0.
+    // Original app (u.smali a([B)V) hardcodes flags=8 for config packets.
+    fun buildConfigHeader(nalSize: Int): ByteArray = buildHeader(nalSize, 0, 8)
+
+    // Build the 352-byte capability announcement packet (type 0x00020005).
+    //
+    // iPhone HD sends 2 formats: [1280×720, H.264, 30fps] and [640×480, H.264, 30fps].
+    // Android 1.13 sends 1 format: [640×480, H.264, 0fps].
+    //
+    // Viewer classifies device type (and whether to show watermark) from these fields:
+    //   [16-19] protocol version: iPhone=0xC9=201, Android=0x12D=301
+    //   payload: number of formats and whether HD (1280×720) is advertised
+    //
+    // We advertise 2 formats matching the iPhone HD protocol to avoid the watermark.
+    // The viewer format-select response will choose format index 1 (640×480), which we
+    // deliver — it chose SD even for the real iPhone HD.
+    //
+    // VideoSize struct (from viewer binary type encoding):
+    //   bits 0-11:  width  (12 bits)
+    //   bits 12-23: height (12 bits)
+    //   bits 24-31: codec type (8 bits): 1=H.264
+    //   bytes 4-7:  frame rate as float32 LE
+    fun buildCapabilityPacket(fps: Int = DEFAULT_FPS): ByteArray {
+        val total = 0x160           // 352 bytes, always fixed
+        val dataSize = total - 28   // 324
+        val buf = ByteArray(total)  // zero-filled
+
+        putLE32(buf, 0,  0xDEADC0DE.toInt())
+        putLE32(buf, 4,  0x00000000)
+        putLE32(buf, 8,  0x00020005)
+        putLE32(buf, 12, dataSize + 12)  // 336 = 0x150
+        putLE32(buf, 16, 0xC9)           // protocol version: iPhone HD value (Android used 0x12D)
+        // [20-23] timestamp = 0
+        // [24-27] = 0x01000000 as found in iPhone pcap (matches iPhone byte pattern)
+        putLE32(buf, 24, 0x01000000)
+
+        // Payload: 2 formats (HD + SD), each 8 bytes: [4-byte VideoSize | 4-byte float rate]
+        putLE32(buf, 28, 2)  // numFormats = 2
+
+        // Format 0: 1280×720, codec=1 (H.264), 30fps — marks us as HD device (no watermark)
+        putLE32(buf, 32, (1 shl 24) or (720 shl 12) or 1280)  // 0x012D0500
+        putLE32(buf, 36, floatToIntBits(fps.toFloat()))
+
+        // Format 1: 640×480, codec=1 (H.264), 30fps — what we actually stream at
+        putLE32(buf, 40, (1 shl 24) or (480 shl 12) or 640)   // 0x011E0280
+        putLE32(buf, 44, floatToIntBits(fps.toFloat()))
+
+        return buf
+    }
+
+    // Build a battery-status packet (type 0x00020006). Not part of the original iPhone/Android
+    // wire protocol — a receiver that doesn't recognize the type just logs and ignores it
+    // (Connection.swift's default case), so this can't break compatibility with anything.
+    // Payload: [0]=level 0-100, [1]=charging (0/1), [2-3]=reserved/pad.
+    fun buildBatteryPacket(levelPct: Int, charging: Boolean): ByteArray {
+        val payload = byteArrayOf(levelPct.coerceIn(0, 100).toByte(), if (charging) 1 else 0, 0, 0)
+        val buf = ByteArray(28 + payload.size)
+        putLE32(buf, 0,  0xDEADC0DE.toInt())
+        putLE32(buf, 4,  0x00000000)
+        putLE32(buf, 8,  0x00020006)
+        putLE32(buf, 12, payload.size + 12)
+        putLE32(buf, 16, 0)
+        putLE32(buf, 20, 0)
+        putLE32(buf, 24, payload.size)
+        payload.copyInto(buf, 28)
+        return buf
+    }
+
+    // Build a focus-state packet (type 0x00020009, phone -> viewer) so the viewer's focus
+    // button can mirror this phone rather than guess. Payload: [0]=state [1]=afSupported
+    // [2-3]=pad. States match FOCUS_STATE_* in MainActivity: 0=auto 1=manual 2=focusing
+    // 3=manual-unsure.
+    //
+    // afSupported was added in the previously-padding byte [1], so an older viewer reads it
+    // as before and a newer viewer talking to an older phone sees 0 — which greys the
+    // control out rather than offering a dead one, the safe way round. It carries capability
+    // alongside state for the same reason the stabilization, frame-rate and camera-facing
+    // packets do: a fixed-focus camera has no lock to take, and a button that silently does
+    // nothing is worse than one that is visibly unavailable.
+    fun buildFocusStatePacket(state: Int, afSupported: Boolean): ByteArray {
+        val payload = byteArrayOf(state.toByte(), if (afSupported) 1 else 0, 0, 0)
+        val buf = ByteArray(28 + payload.size)
+        putLE32(buf, 0,  0xDEADC0DE.toInt())
+        putLE32(buf, 4,  0x00000000)
+        putLE32(buf, 8,  0x00020009)
+        putLE32(buf, 12, payload.size + 12)
+        putLE32(buf, 16, 0)
+        putLE32(buf, 20, 0)
+        putLE32(buf, 24, payload.size)
+        payload.copyInto(buf, 28)
+        return buf
+    }
+
+    // Stabilization state (type 0x0002000B, phone -> viewer). Carries capability as well as
+    // state so the viewer can hide the control on a camera that can't do it, rather than
+    // offering a button that silently does nothing.
+    // Payload: [0]=eisSupported [1]=eisOn [2]=oisSupported [3]=oisOn
+    fun buildStabilizationPacket(eisSupported: Boolean, eisOn: Boolean,
+                                 oisSupported: Boolean, oisOn: Boolean): ByteArray {
+        val payload = byteArrayOf(
+            if (eisSupported) 1 else 0, if (eisOn) 1 else 0,
+            if (oisSupported) 1 else 0, if (oisOn) 1 else 0)
+        val buf = ByteArray(28 + payload.size)
+        putLE32(buf, 0,  0xDEADC0DE.toInt())
+        putLE32(buf, 4,  0x00000000)
+        putLE32(buf, 8,  0x0002000B)
+        putLE32(buf, 12, payload.size + 12)
+        putLE32(buf, 16, 0)
+        putLE32(buf, 20, 0)
+        putLE32(buf, 24, payload.size)
+        payload.copyInto(buf, 28)
+        return buf
+    }
+
+    // Frame-rate state (type 0x0002000D, phone -> viewer). Like the stabilization packet,
+    // it carries capability alongside state: a camera that can't sustain 60 gets the option
+    // greyed out in the viewer instead of a control that silently falls back to 30.
+    // Payload: [0]=current fps [1]=highFpsSupported [2-3]=pad
+    fun buildFpsStatePacket(currentFps: Int, highFpsSupported: Boolean): ByteArray {
+        val payload = byteArrayOf(
+            currentFps.coerceIn(0, 255).toByte(), if (highFpsSupported) 1 else 0, 0, 0)
+        val buf = ByteArray(28 + payload.size)
+        putLE32(buf, 0,  0xDEADC0DE.toInt())
+        putLE32(buf, 4,  0x00000000)
+        putLE32(buf, 8,  0x0002000D)
+        putLE32(buf, 12, payload.size + 12)
+        putLE32(buf, 16, 0)
+        putLE32(buf, 20, 0)
+        putLE32(buf, 24, payload.size)
+        payload.copyInto(buf, 28)
+        return buf
+    }
+
+    // Camera-facing state (type 0x0002000F, phone -> viewer). Capability travels with state,
+    // as with stabilization and frame rate: a phone with no front camera gets the control
+    // disabled rather than a button that silently does nothing.
+    // Payload: [0]=facingFront [1]=frontAvailable [2]=backAvailable [3]=pad
+    fun buildCameraStatePacket(facingFront: Boolean, frontAvailable: Boolean,
+                               backAvailable: Boolean): ByteArray {
+        val payload = byteArrayOf(
+            if (facingFront) 1 else 0, if (frontAvailable) 1 else 0,
+            if (backAvailable) 1 else 0, 0)
+        val buf = ByteArray(28 + payload.size)
+        putLE32(buf, 0,  0xDEADC0DE.toInt())
+        putLE32(buf, 4,  0x00000000)
+        putLE32(buf, 8,  0x0002000F)
+        putLE32(buf, 12, payload.size + 12)
+        putLE32(buf, 16, 0)
+        putLE32(buf, 20, 0)
+        putLE32(buf, 24, payload.size)
+        payload.copyInto(buf, 28)
+        return buf
+    }
+
+    private fun putLE32(buf: ByteArray, offset: Int, value: Int) {
+        buf[offset]     = (value and 0xFF).toByte()
+        buf[offset + 1] = ((value shr 8) and 0xFF).toByte()
+        buf[offset + 2] = ((value shr 16) and 0xFF).toByte()
+        buf[offset + 3] = ((value shr 24) and 0xFF).toByte()
+    }
+}

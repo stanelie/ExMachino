@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/rootLayout"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000"
+    android:clickable="true">
+
+    <com.exmachina.epoccamstreamer.AspectRatioSurfaceView
+        android:id="@+id/surfaceView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_gravity="center" />
+
+    <TextView
+        android:id="@+id/statusText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:padding="8dp"
+        android:textColor="#FFFFFF"
+        android:textSize="12sp"
+        android:background="#80000000"
+        android:text="Starting..." />
+
+    <TextView
+        android:id="@+id/notConnectedBanner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:gravity="center"
+        android:paddingTop="14dp"
+        android:paddingBottom="14dp"
+        android:text="NOT CONNECTED"
+        android:textColor="#FFFFFF"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:background="#CCBB2222"
+        android:visibility="visible" />
+
+    <!-- Battery + focus toggle: upper-right, out of the way of the lock button below. -->
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_margin="8dp"
+        android:orientation="vertical"
+        android:gravity="end">
+
+        <TextView
+            android:id="@+id/batteryText"
+            android:layout_width="64dp"
+            android:layout_height="36dp"
+            android:layout_marginBottom="6dp"
+            android:gravity="center"
+            android:text="--%"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp"
+            android:textStyle="bold"
+            android:background="#80000000" />
+
+        <Button
+            android:id="@+id/focusModeButton"
+            android:layout_width="128dp"
+            android:layout_height="72dp"
+            android:text="auto\nfocus"
+            android:textSize="18sp"
+            android:textColor="#FFFFFF"
+            android:backgroundTint="#80000000"
+            android:maxLines="2"
+            android:gravity="center"
+            android:padding="0dp" />
+
+        <!-- Front/back camera. Sits under the focus toggle, same size, so the two
+             upper-right controls read as a pair. -->
+        <Button
+            android:id="@+id/cameraButton"
+            android:layout_width="128dp"
+            android:layout_height="72dp"
+            android:layout_marginTop="6dp"
+            android:text="back\ncamera"
+            android:textSize="18sp"
+            android:textColor="#FFFFFF"
+            android:backgroundTint="#80000000"
+            android:maxLines="2"
+            android:gravity="center"
+            android:padding="0dp" />
+
+    </LinearLayout>
+
+    <!-- Lock: lower-right, away from the top of frame where tap-to-focus is most likely
+         (moving it here fixed manual-focus taps near a framed subject accidentally hitting it). -->
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|end"
+        android:layout_margin="8dp"
+        android:orientation="vertical"
+        android:gravity="end">
+
+        <Button
+            android:id="@+id/lockButton"
+            android:layout_width="128dp"
+            android:layout_height="72dp"
+            android:text="LOCK"
+            android:textSize="16sp"
+            android:textColor="#FFFFFF"
+            android:backgroundTint="#CC224488"
+            android:padding="0dp" />
+
+        <TextView
+            android:id="@+id/lockedBadge"
+            android:layout_width="128dp"
+            android:layout_height="72dp"
+            android:gravity="center"
+            android:text="LOCKED"
+            android:textColor="#FFFFFF"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:background="#CC992222"
+            android:visibility="gone" />
+
+    </LinearLayout>
+
+</FrameLayout>

@@ -1,0 +1,46 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.exmachina.epoccamstreamer'
+    compileSdk 33
+
+    defaultConfig {
+        applicationId "com.exmachina.epoccamstreamer"
+        minSdk 23
+        targetSdk 33
+        versionCode 5
+        versionName "2.4.1"
+    }
+
+    buildTypes {
+        debug { debuggable true }
+    }
+
+    applicationVariants.all { variant ->
+        variant.outputs.all {
+            outputFileName = "epoccam-streamer.apk"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.9.0'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    // Pure-Java mDNS responder. Replaces android.net.nsd.NsdManager, whose daemon was
+    // measured registering this service in 2s, 73s and 109s on the same phone with
+    // identical code — and which cannot be safely forced (rapid re-registration wedges it
+    // outright). JmDNS keeps registration in-process where we control it.
+    implementation 'org.jmdns:jmdns:3.5.9'
+}

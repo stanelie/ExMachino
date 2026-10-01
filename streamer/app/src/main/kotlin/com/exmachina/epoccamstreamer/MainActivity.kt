@@ -1,0 +1,994 @@
+package com.exmachina.epoccamstreamer
+
+import android.Manifest
+import android.app.Activity
+import android.app.ActivityManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.os.BatteryManager
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.net.wifi.WifiManager
+import android.os.Bundle
+import android.util.Log
+import android.content.Intent
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.SurfaceHolder
+import android.view.WindowManager
+import android.view.View
+import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.TextView
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import java.util.concurrent.atomic.AtomicBoolean
+
+
+private const val TAG = "MainActivity"
+private const val NSD_TYPE  = "_epoccam._tcp"
+private const val LISTEN_PORT = 5054
+
+// Focus button labels. Two lines each so the wording fits the existing 128x72dp button
+// without resizing it; short enough not to ellipsize at 18sp.
+private const val FOCUS_AUTO    = "auto\nfocus"
+private const val FOCUS_MANUAL  = "manual\nfocus"
+private const val FOCUS_BUSY    = "focusing\n…"
+private const val FOCUS_UNSURE  = "manual\nfocus?"   // AF never reported a lock
+private const val FOCUS_NONE    = "fixed\nfocus"    // this camera cannot focus at all
+
+// Focus state, mirrored to the viewer so its button shows what this phone is actually
+// doing rather than what it last asked for. Must stay in sync with the viewer's FocusState.
+private const val FOCUS_STATE_AUTO   = 0
+private const val FOCUS_STATE_MANUAL = 1
+private const val FOCUS_STATE_BUSY   = 2
+private const val FOCUS_STATE_UNSURE = 3
+
+// Focus commands accepted from the viewer.
+private const val FOCUS_CMD_AUTO    = 0
+private const val FOCUS_CMD_MANUAL  = 1
+private const val FOCUS_CMD_REFOCUS = 2
+
+// Must match the formats advertised in Protocol.buildCapabilityPacket(): index 0=HD, index 1=SD.
+private val FORMATS  = listOf(Pair(1280, 720), Pair(640, 480))
+// Bitrates from Android 1.13 smali: h.c=0x3567E0 for 1280×720, h.c=0x2625A0 for 720×480 (SD).
+private val BITRATES = listOf(3_500_000, 1_200_000)
+
+class MainActivity : Activity(), SurfaceHolder.Callback {
+
+    private lateinit var statusText: TextView
+    private lateinit var notConnectedBanner: TextView
+    private lateinit var surfaceHolder: SurfaceHolder
+    private lateinit var previewView: AspectRatioSurfaceView
+    private lateinit var focusModeButton: Button
+    private lateinit var lockButton: Button
+    private lateinit var cameraButton: Button
+    private lateinit var lockedBadge: TextView
+    private lateinit var batteryText: TextView
+
+    // Battery overlay: level + charging state, so an operator can see at a glance whether a
+    // phone is about to die mid-show. ACTION_BATTERY_CHANGED is sticky, so registering the
+    // receiver delivers the current state immediately.
+    private val batteryReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            intent ?: return
+            val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+            val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+            if (level < 0 || scale <= 0) return
+            val pct = level * 100 / scale
+            val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+            val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                           status == BatteryManager.BATTERY_STATUS_FULL ||
+                           intent.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0
+            lastBatteryPct = pct
+            lastBatteryCharging = charging
+            batteryText.text = if (charging) "⚡$pct%" else "$pct%"
+            batteryText.setTextColor(when {
+                charging  -> 0xFF00FF00.toInt()   // charging
+                pct <= 15 -> 0xFFFF4444.toInt()   // critical
+                pct <= 30 -> 0xFFFFCC00.toInt()   // low
+                else      -> 0xFFFFFFFF.toInt()
+            })
+        }
+    }
+    // Cached from the sticky ACTION_BATTERY_CHANGED above so the periodic wire report (which
+    // runs on its own once-a-minute cadence, decoupled from the on-device overlay's live
+    // updates) always has a current value to send without querying BatteryManager itself.
+    @Volatile private var lastBatteryPct = -1
+    @Volatile private var lastBatteryCharging = false
+    private var tapFocusMode = false  // false = continuous AF, true = tap-to-lock
+    // Guards triggerFocus() against overlapping calls: without it, a second tap landing while
+    // the first is still converging silently resets the whole AF trigger sequence (cancelling
+    // the in-flight attempt), so focus can appear to never lock and the button text flickers as
+    // separate attempts' callbacks land out of order.
+    @Volatile private var focusInProgress = false
+    @Volatile private var focusState = FOCUS_STATE_AUTO
+    // Survives encoder rebuilds: a resolution change constructs a new CameraEncoder, which
+    // would otherwise come up with stabilization off no matter what the viewer asked for.
+    @Volatile private var desiredEIS = false
+    private val focusTimeoutHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var locked = false
+    private var pinningConfirmed = false
+    private var server: StreamingServer? = null
+    @Volatile private var encoder: CameraEncoder? = null
+    // mDNS is served in-process by JmDNS rather than android.net.nsd.NsdManager. The system
+    // daemon was measured registering this service in 2s, 73s and 109s on the same phone with
+    // identical code, and cannot be forced: keying a retry off onServiceRegistered() fails
+    // because that callback does not fire reliably even when the record *is* on the wire, and
+    // rapid re-registration wedges the daemon outright (nothing advertises until Wi-Fi is
+    // toggled). JmDNS keeps registration where we can see and control it.
+    @Volatile private var jmdns: javax.jmdns.JmDNS? = null
+    @Volatile private var mdnsRegistered = false
+    // JmDNS.create() and registerService() block on network I/O (mDNS probing), and close()
+    // can take seconds — all of it must stay off the main thread. Single-threaded so
+    // register/unregister can never interleave.
+    private val mdnsExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "epoc-mdns").apply { isDaemon = true }
+    }
+    // The IPv4 currently baked into the mDNS "ip" TXT. Tracked so we can re-advertise
+    // when the phone's address changes (e.g. Wi-Fi roam) — otherwise the viewer keeps
+    // dialing a stale address and can never reconnect.
+    @Volatile private var advertisedIp: String? = null
+
+    // Stable per-install id (survives reboots/IP changes/MAC rotation; only a factory
+    // reset or app-data wipe changes it). It does double duty: it makes this phone's
+    // mDNS instance name unique (two phones both named "mobile" would collapse into one
+    // on the viewer) AND it's advertised as the "id" the viewer uses as the slot key.
+    // No UI — the operator still assigns/swaps slots entirely on the viewer.
+    private val deviceId: String by lazy {
+        val prefs = getSharedPreferences("epoccam", MODE_PRIVATE)
+        prefs.getString("deviceId", null) ?: java.util.UUID.randomUUID().toString().also {
+            prefs.edit().putString("deviceId", it).apply()
+        }
+    }
+
+    // Driven from the viewer (and persisted there, like the resolution and EIS choices) —
+    // survives encoder rebuilds so a resolution change doesn't silently drop back to 30.
+    @Volatile private var desiredFps = DEFAULT_FPS
+
+    // Which camera to open. Persisted on the phone itself (not just in the viewer) so the
+    // operator can preset a phone and have it come up facing the right way at launch, before
+    // any viewer is connected. The viewer's own per-slot setting is re-applied on connect,
+    // like resolution and frame rate, so a connected viewer has the final say.
+    @Volatile private var desiredFront = false
+    private fun loadCameraPref() {
+        desiredFront = getSharedPreferences("epoccam", MODE_PRIVATE)
+            .getBoolean("useFrontCamera", false)
+    }
+    private fun saveCameraPref() {
+        getSharedPreferences("epoccam", MODE_PRIVATE).edit()
+            .putBoolean("useFrontCamera", desiredFront).apply()
+    }
+
+    // Default to SD (format index 1 = 640×480); switched to HD on viewer request.
+    @Volatile private var currentFmt = 1
+
+    private val configSent     = AtomicBoolean(false)
+    private val formatSelected = AtomicBoolean(false)
+
+    // Keyframe self-heal: track the last IDR so the watchdog can recreate a wedged
+    // encoder (one that stops emitting keyframes) while a viewer is connected.
+    @Volatile private var lastKeyframeMs = 0L
+    @Volatile private var lastEncoderRestartMs = 0L
+    private val encoderRestarting = AtomicBoolean(false)
+
+    private val watchdogHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val watchdogRunnable = object : Runnable {
+        override fun run() {
+            val srv = server
+            if (srv != null && configSent.get()) {
+                val stale = srv.msSinceLastWrite()
+                if (stale != null && stale > 8_000L) {
+                    Log.w(TAG, "watchdog: no write in ${stale}ms — forcing reconnect")
+                    srv.forceDisconnect()
+                }
+            }
+            // Keyframe self-heal: a wedged MediaCodec keeps emitting P-frames but no IDR,
+            // so a viewer gets an undecodable stream. If no keyframe has flowed for a while
+            // with a viewer connected, recreate the encoder. Rate-limited so it can't storm.
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (srv != null && srv.hasActiveConnection() && formatSelected.get() &&
+                lastKeyframeMs > 0 && now - lastKeyframeMs > 5_000L &&
+                now - lastEncoderRestartMs > 10_000L) {
+                Log.w(TAG, "watchdog: no keyframe in ${now - lastKeyframeMs}ms — recreating encoder")
+                restartEncoderAsync()
+            }
+            watchdogHandler.postDelayed(this, 3_000L)
+        }
+    }
+    // Reports battery level/charging to the viewer once a minute — separate from the on-device
+    // overlay above, which updates live on every ACTION_BATTERY_CHANGED. Also fired once
+    // immediately on viewer connect (see startStreamingClean's onStatus) so the viewer isn't
+    // blank for up to a minute after joining.
+    private val batteryReportRunnable = object : Runnable {
+        override fun run() {
+            sendBatteryReport()
+            watchdogHandler.postDelayed(this, 60_000L)
+        }
+    }
+    private fun sendBatteryReport() {
+        val pct = lastBatteryPct
+        if (pct < 0) return
+        server?.enqueue(Protocol.buildBatteryPacket(pct, lastBatteryCharging))
+    }
+    private var wifiLock: WifiManager.WifiLock? = null
+    // Held while streaming so the Wi-Fi driver stops filtering inbound broadcast frames.
+    // ARP requests are broadcast, so without this a viewer with no cached ARP entry for us
+    // can stall for seconds before its TCP SYN goes anywhere — even though this phone is
+    // wide awake with the screen on. (WIFI_MODE_FULL_HIGH_PERF above doesn't cover this,
+    // and is a no-op on API 29+ anyway.)
+    private var multicastLock: WifiManager.MulticastLock? = null
+    @Volatile private var codecConfig: ByteArray? = null
+
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile private var networkCallbackActive = false
+    private val networkActivateRunnable = Runnable { networkCallbackActive = true }
+
+    companion object {
+        // The MainActivity that currently owns the stream (camera + port 5054 + foreground
+        // service). Streaming keeps running in the background, so a later launch can collide
+        // with a still-live instance. A fresh start tears this one down first for a clean start.
+        @Volatile private var active: MainActivity? = null
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        // Before anything builds an encoder: this decides which camera gets opened.
+        loadCameraPref()
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        setContentView(R.layout.activity_main)
+        statusText = findViewById(R.id.statusText)
+        notConnectedBanner = findViewById(R.id.notConnectedBanner)
+        previewView = findViewById(R.id.surfaceView)
+        previewView.aspectRatio = FORMATS[currentFmt].first.toFloat() / FORMATS[currentFmt].second
+        surfaceHolder = previewView.holder
+        surfaceHolder.addCallback(this)
+
+        focusModeButton = findViewById(R.id.focusModeButton)
+        focusModeButton.setOnClickListener {
+            if (!afSupported()) return@setOnClickListener
+            if (tapFocusMode) {
+                applyAutoFocus()
+            } else {
+                // Lock focus immediately — don't wait for a separate screen tap. A later tap
+                // (while already in MF mode) re-locks at that point via the same path.
+                tapFocusMode = true
+                triggerFocus()
+            }
+        }
+
+        cameraButton = findViewById(R.id.cameraButton)
+        cameraButton.setOnClickListener {
+            // Off the main thread: the rebuild blocks on the camera close.
+            val want = !desiredFront
+            cameraButton.isEnabled = false
+            Thread({
+                onCameraSelected(want)
+                runOnUiThread { cameraButton.isEnabled = true }
+            }, "epoc-camswitch").start()
+        }
+        updateCameraButton()
+
+        lockButton = findViewById(R.id.lockButton)
+        lockedBadge = findViewById(R.id.lockedBadge)
+        lockButton.setOnClickListener { enableLock() }
+
+        batteryText = findViewById(R.id.batteryText)
+        registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+
+        val root = findViewById<FrameLayout>(R.id.rootLayout)
+        root.setOnTouchListener { _, event ->
+            if (event.action == MotionEvent.ACTION_DOWN && tapFocusMode) {
+                triggerFocus(); true
+            } else false
+        }
+
+        val missingPerms = listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+            .filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
+        if (missingPerms.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, missingPerms.toTypedArray(), 1)
+        }
+    }
+
+    // Single place that changes focus state: updates this phone's button and reports to the
+    // viewer, so the two can't drift apart.
+    private fun setFocusState(state: Int) {
+        focusState = state
+        // A fixed-focus camera gets a visibly dead button rather than a live one that does
+        // nothing: the S7-class front cameras cannot focus at all, and the old behaviour was
+        // to accept the press, show "focusing…" and time out into "manual focus?" — which
+        // reads as a bug in the app rather than a limit of the hardware.
+        val supported = afSupported()
+        focusModeButton.isEnabled = supported
+        focusModeButton.alpha = if (supported) 1f else 0.4f
+        focusModeButton.text = if (!supported) FOCUS_NONE else when (state) {
+            FOCUS_STATE_AUTO   -> FOCUS_AUTO
+            FOCUS_STATE_MANUAL -> FOCUS_MANUAL
+            FOCUS_STATE_BUSY   -> FOCUS_BUSY
+            else               -> FOCUS_UNSURE
+        }
+        sendFocusState()
+    }
+
+    // Whether the camera currently open can focus. Read off the live encoder rather than
+    // remembered, because it changes with the camera: the back camera focuses and the front
+    // one may not.
+    private fun afSupported(): Boolean = encoder?.hasAutoFocus ?: false
+
+    private fun sendFocusState() {
+        server?.enqueue(Protocol.buildFocusStatePacket(focusState, afSupported()))
+    }
+
+    // A new CameraEncoder always comes up in continuous AF, so any lock taken before a
+    // rebuild (camera switch, resolution or frame-rate change, self-heal) no longer exists —
+    // and the newly opened camera may not focus at all. Without this reset tapFocusMode stayed
+    // true across a camera switch: phone and viewer both still read "manual focus" while the
+    // lens was in fact hunting, and the next press of the focus button took the *auto* branch,
+    // so engaging manual focus on the newly selected camera did nothing until pressed twice.
+    private fun resetFocusAfterRebuild() = runOnUiThread {
+        tapFocusMode = false
+        focusInProgress = false
+        focusTimeoutHandler.removeCallbacksAndMessages(null)
+        setFocusState(FOCUS_STATE_AUTO)
+    }
+
+    // Capability + state, so the viewer can render the control correctly instead of guessing
+    // what this phone can do. OIS has no toggle: it is enabled whenever present.
+    private fun sendStabilizationState() {
+        val e = encoder ?: return
+        server?.enqueue(Protocol.buildStabilizationPacket(
+            eisSupported = e.hasEIS, eisOn = e.eisEnabled,
+            oisSupported = e.hasOIS, oisOn = e.hasOIS))
+    }
+
+    // Frame-rate capability + what the encoder actually settled on. The phone may clamp a
+    // 60fps request (see CameraEncoder.pickFpsRange), so the viewer is told the real rate
+    // rather than assuming its request was honoured.
+    private fun sendFpsState() {
+        val e = encoder ?: return
+        server?.enqueue(Protocol.buildFpsStatePacket(e.activeFps, e.supportsHighFps))
+    }
+
+    private fun updateCameraButton() {
+        if (!::cameraButton.isInitialized) return
+        cameraButton.text = if (desiredFront) "front\ncamera" else "back\ncamera"
+    }
+
+    // Which camera is actually open, plus what this device has. Sent after every rebuild,
+    // so a phone that fell back (no front camera, or it failed to open) reports the camera it
+    // really got rather than the one that was asked for.
+    private fun sendCameraState() {
+        val e = encoder ?: return
+        server?.enqueue(Protocol.buildCameraStatePacket(
+            facingFront = e.facingFront,
+            frontAvailable = e.hasFrontCamera, backAvailable = e.hasBackCamera))
+    }
+
+    // Front/back switch. The camera device itself changes, so there is nothing to
+    // reconfigure on the running session — it is a full rebuild, same as a frame-rate change,
+    // and must not run on the main thread for the same reason (stop() blocks on the close).
+    fun onCameraSelected(front: Boolean) {
+        if (front == desiredFront && encoder != null) {
+            Log.w(TAG, "onCameraSelected: already ${if (front) "front" else "back"} — reporting state only")
+            sendCameraState()
+            return
+        }
+        Log.w(TAG, "camera change: ${if (desiredFront) "front" else "back"} → ${if (front) "front" else "back"}")
+        desiredFront = front
+        saveCameraPref()
+        rebuildEncoderForFormat(currentFmt, geometryChanged = false)
+        // Settle on the camera actually opened, so a phone with no front camera doesn't sit
+        // with desiredFront=true and rebuild on every later request for the camera it is
+        // already using.
+        encoder?.let {
+            if (it.facingFront != desiredFront) {
+                Log.w(TAG, "camera fell back to ${if (it.facingFront) "front" else "back"}")
+                desiredFront = it.facingFront
+                saveCameraPref()
+            }
+        }
+        runOnUiThread { updateCameraButton() }
+    }
+
+    // Frame-rate change from the viewer. MediaCodec's frame rate and the camera's AE target
+    // range are both fixed at construction, so this rebuilds the encoder exactly as a
+    // resolution change does — and, like that path, must not run on the main thread.
+    fun onFpsSelected(requested: Int) {
+        val want = if (requested >= HIGH_FPS) HIGH_FPS else DEFAULT_FPS
+        if (want == desiredFps && encoder != null) {
+            Log.w(TAG, "onFpsSelected: already at ${want}fps — reporting state only")
+            sendFpsState()
+            return
+        }
+        Log.w(TAG, "frame-rate change: ${desiredFps}fps → ${want}fps")
+        desiredFps = want
+        rebuildEncoderForFormat(currentFmt, geometryChanged = false)
+        // Settle on what the camera actually delivered, not what was asked for. A phone that
+        // can't do 60 clamps to 30 (see CameraEncoder.pickFpsRange); recording the request
+        // instead would leave desiredFps permanently disagreeing with the running encoder, so
+        // every later request for the rate it is *already* running would look like a change
+        // and rebuild the encoder again — on every reconnect, forever.
+        encoder?.let {
+            if (it.activeFps != desiredFps) {
+                Log.w(TAG, "frame rate clamped to ${it.activeFps}fps by the camera")
+                desiredFps = it.activeFps
+            }
+        }
+    }
+
+    // Focus commands from the viewer. Touches the UI and the encoder, so it runs on the
+    // main thread rather than the socket's receive thread.
+    private fun onFocusCommandFromViewer(cmd: Int) = runOnUiThread {
+        // A viewer that predates the capability byte, or one whose operator got the command in
+        // before the state packet landed, can still ask a fixed-focus camera to focus. Answer
+        // with the real state rather than starting a lock that cannot complete.
+        if (cmd != FOCUS_CMD_AUTO && !afSupported()) {
+            Log.w(TAG, "focus command $cmd: this camera is fixed-focus, reporting state only")
+            setFocusState(FOCUS_STATE_AUTO)
+            return@runOnUiThread
+        }
+        when (cmd) {
+            FOCUS_CMD_AUTO    -> if (tapFocusMode) applyAutoFocus()
+            FOCUS_CMD_MANUAL  -> if (!tapFocusMode) { tapFocusMode = true; triggerFocus() }
+            FOCUS_CMD_REFOCUS -> if (tapFocusMode) triggerFocus()
+            else -> Log.w(TAG, "unknown focus command $cmd")
+        }
+    }
+
+    // Back to continuous AF. Cancels any in-flight tap-focus attempt so its timeout can't
+    // later overwrite this with a stale "manual focus?" — setContinuousAf() clears the
+    // camera-side AF listener, which would otherwise leave triggerAfAndLock's onDone
+    // never called and focusInProgress stuck.
+    private fun applyAutoFocus() {
+        tapFocusMode = false
+        focusInProgress = false
+        focusTimeoutHandler.removeCallbacksAndMessages(null)
+        setFocusState(FOCUS_STATE_AUTO)
+        encoder?.setContinuousAf()
+    }
+
+    private fun triggerFocus() {
+        if (focusInProgress) return  // ignore a retap while the previous attempt is still converging
+        val enc = encoder ?: return
+        if (!enc.hasAutoFocus) {
+            // Nothing to focus. Report state so the viewer's button settles instead of
+            // waiting on a convergence that is never coming.
+            Log.w(TAG, "triggerFocus: ${if (enc.facingFront) "front" else "back"} camera is fixed-focus, ignored")
+            tapFocusMode = false
+            setFocusState(FOCUS_STATE_AUTO)
+            return
+        }
+        focusInProgress = true
+        setFocusState(FOCUS_STATE_BUSY)
+        // Safety net: if the camera never reports a final AF state (edge case — see
+        // CameraEncoder.triggerAfAndLock), don't leave focus permanently stuck ignoring taps.
+        focusTimeoutHandler.postDelayed({ finishFocus(focused = false) }, 4_000L)
+        // A lock that never started must not leave the button reading "focusing…" for the
+        // full timeout: undo the optimistic state immediately instead.
+        if (!enc.triggerAfAndLock { focused -> runOnUiThread { finishFocus(focused) } }) {
+            Log.w(TAG, "triggerFocus: the camera would not start a lock")
+            tapFocusMode = false
+            focusInProgress = false
+            focusTimeoutHandler.removeCallbacksAndMessages(null)
+            setFocusState(FOCUS_STATE_AUTO)
+        }
+    }
+
+    private fun finishFocus(focused: Boolean) {
+        if (!focusInProgress) return  // already finished (e.g. the timeout fired after the real callback)
+        focusInProgress = false
+        focusTimeoutHandler.removeCallbacksAndMessages(null)
+        setFocusState(if (focused) FOCUS_STATE_MANUAL else FOCUS_STATE_UNSURE)
+    }
+
+    override fun onRequestPermissionsResult(req: Int, perms: Array<String>, results: IntArray) {
+        super.onRequestPermissionsResult(req, perms, results)
+        if (results.isNotEmpty() && results[0] == PackageManager.PERMISSION_GRANTED) startStreaming()
+    }
+
+    override fun surfaceCreated(holder: SurfaceHolder) {
+        Log.w(TAG, "surfaceCreated: encoder=$encoder server=$server")
+        val cameraOk = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+        val audioOk  = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        if (!cameraOk || !audioOk) return
+        if (server == null) startStreaming()
+    }
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {
+        Log.w(TAG, "surfaceChanged: ${w}x${h}")
+        if (server != null) encoder?.updatePreview(holder)
+    }
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
+        Log.w(TAG, "surfaceDestroyed: encoder=$encoder")
+        encoder?.updatePreview(null)
+    }
+
+    @Suppress("OVERRIDE_DEPRECATION")
+    override fun onBackPressed() {
+        moveTaskToBack(true)  // minimize instead of finish
+    }
+
+    fun onViewerDisconnected() {
+        formatSelected.set(false)
+        configSent.set(false)
+        server?.configPacket = null
+        Log.d(TAG, "viewer disconnected — reset stream gate, refreshing mDNS")
+        // Viewer waits for mDNS goodbye+reannounce before reconnecting after resolution change.
+        scheduleMdnsRefresh()
+    }
+
+    fun onFormatSelected(index: Int) {
+        val fmt = index.coerceIn(0, FORMATS.size - 1)
+        Log.w(TAG, "onFormatSelected: idx=$fmt (${FORMATS[fmt].first}×${FORMATS[fmt].second}) currentFmt=$currentFmt configSent=${configSent.get()} formatSelected=${formatSelected.get()} codecConfig=${codecConfig?.size}B")
+        configSent.set(false)
+        lastKeyframeMs = android.os.SystemClock.elapsedRealtime()  // start the keyframe watchdog window from this (re)connect
+
+        if (fmt == currentFmt) {
+            // Same resolution: just open gate and request a fresh IDR.
+            Log.w(TAG, "same resolution — requesting IDR, setting formatSelected=true")
+            formatSelected.set(true)
+            encoder?.requestIDR()
+        } else {
+            // Resolution change: close gate, flush stale frames, stop old encoder, start new one.
+            Log.w(TAG, "resolution change: ${FORMATS[currentFmt].first}×${FORMATS[currentFmt].second} → ${FORMATS[fmt].first}×${FORMATS[fmt].second}")
+            rebuildEncoderForFormat(fmt, geometryChanged = true)
+        }
+    }
+
+    // Tear down and rebuild the encoder at `fmt` and the current desiredFps. Shared by the
+    // resolution and frame-rate paths: both are fixed at CameraEncoder construction, so both
+    // need exactly this sequence (close the gate, drop stale frames, swap, reopen).
+    // `geometryChanged` is false for a frame-rate change, where the resolution is identical.
+    // It decides who hands the new encoder the preview surface: on a resolution change the
+    // view resizes, so surfaceChanged() fires and delivers it. On a same-size rebuild nothing
+    // resizes, surfaceChanged() never fires, and an encoder built with a null holder would
+    // leave the phone's own preview frozen on its last frame forever while the stream — a
+    // separate surface — carried on normally. So that case hands over the live holder here.
+    private fun rebuildEncoderForFormat(fmt: Int, geometryChanged: Boolean) {
+        formatSelected.set(false)
+        currentFmt = fmt
+        codecConfig = null
+        server?.flushQueue()
+        val old = encoder
+        encoder = null
+        Log.w(TAG, "stopping old encoder")
+        old?.stop()
+        Log.w(TAG, "old encoder stopped, starting new encoder ${FORMATS[fmt].first}×${FORMATS[fmt].second} @${desiredFps}fps")
+        val holder = if (geometryChanged) null
+                     else surfaceHolder.takeIf { it.surface?.isValid == true }
+        Log.w(TAG, "rebuild: geometryChanged=$geometryChanged preview=${if (holder != null) "attached" else "deferred"}")
+        encoder = CameraEncoder(
+            context       = this,
+            previewHolder = holder,  // null: surfaceChanged() will deliver it once the view resizes
+            width         = FORMATS[fmt].first,
+            height        = FORMATS[fmt].second,
+            fps           = desiredFps,
+            bitrate       = BITRATES[fmt],
+            initialEIS    = desiredEIS,
+            useFrontCamera = desiredFront,
+            onNalUnit     = ::onNalUnit
+        ).also { it.start() }
+        // A rebuild resets what the viewer knows: report the new encoder's capability and
+        // state, or the viewer's control stays stale (or briefly claims "unsupported",
+        // read off an encoder that was being torn down).
+        sendStabilizationState()
+        sendFpsState()
+        sendCameraState()
+        resetFocusAfterRebuild()
+        formatSelected.set(true)
+        if (!geometryChanged) {
+            Log.w(TAG, "new encoder started (same geometry — no relayout needed)")
+            return
+        }
+        Log.w(TAG, "new encoder started; posting aspect ratio update to main thread")
+        // Assign encoder BEFORE posting so the happens-before from Handler.post ensures
+        // the main thread sees the new encoder value when surfaceCreated fires.
+        runOnUiThread {
+            Log.w(TAG, "requestLayout: aspectRatio=${FORMATS[fmt].first}/${FORMATS[fmt].second}")
+            previewView.aspectRatio = FORMATS[fmt].first.toFloat() / FORMATS[fmt].second
+            previewView.requestLayout()
+        }
+    }
+
+    // Backstop for a MediaCodec that wedged (stops emitting keyframes): tear it down and
+    // build a fresh one at the current resolution. Runs off the main thread (stop() blocks
+    // on the camera close) and is single-flighted via encoderRestarting.
+    private fun restartEncoderAsync() {
+        if (!encoderRestarting.compareAndSet(false, true)) return
+        lastEncoderRestartMs = android.os.SystemClock.elapsedRealtime()
+        Thread({
+            try {
+                Log.w(TAG, "SELF-HEAL: recreating encoder (currentFmt=$currentFmt)")
+                formatSelected.set(false)
+                configSent.set(false)
+                codecConfig = null
+                server?.flushQueue()
+                val old = encoder
+                encoder = null
+                old?.stop()
+                val fmt = currentFmt
+                encoder = CameraEncoder(
+                    // Keep the local preview live across the recreate (only if the surface is
+                    // valid — i.e. app is foregrounded; when backgrounded it's stream-only).
+                    context       = this,
+                    previewHolder = surfaceHolder.takeIf { it.surface?.isValid == true },
+                    width         = FORMATS[fmt].first,
+                    height        = FORMATS[fmt].second,
+                    fps           = desiredFps,
+                    bitrate       = BITRATES[fmt],
+                    initialEIS    = desiredEIS,
+                    useFrontCamera = desiredFront,
+                    onNalUnit     = ::onNalUnit
+                ).also { it.start() }
+                // A rebuild resets what the viewer knows: report the new encoder's capability
+                // and state, or the viewer's control stays stale (or briefly claims
+                // "unsupported", read off an encoder that was being torn down).
+                sendStabilizationState()
+                sendFpsState()
+                sendCameraState()
+                resetFocusAfterRebuild()
+                lastKeyframeMs = android.os.SystemClock.elapsedRealtime()
+                formatSelected.set(true)
+                Log.w(TAG, "SELF-HEAL: encoder recreated")
+            } catch (e: Exception) {
+                Log.e(TAG, "SELF-HEAL failed: $e")
+            } finally {
+                encoderRestarting.set(false)
+            }
+        }, "epoc-encoder-heal").start()
+    }
+
+
+    // First non-loopback IPv4 (wlan0). Advertised in TXT so the viewer connects to
+    // this exact phone, sidestepping the shared "Android.local" hostname that two
+    // Android phones both claim.
+    private fun localIpv4(): String? {
+        return try {
+            java.net.NetworkInterface.getNetworkInterfaces().toList()
+                .filter { it.isUp && !it.isLoopback }
+                .flatMap { it.inetAddresses.toList() }
+                .firstOrNull { it is java.net.Inet4Address && !it.isLoopbackAddress }
+                ?.hostAddress
+        } catch (_: Exception) { null }
+    }
+
+
+    private fun registerMdns() {
+        val ip = localIpv4()         // freeze the address we're about to advertise
+        advertisedIp = ip
+        val name = "mobile-${deviceId.take(8)}"
+        mdnsExecutor.execute {
+            closeJmdns()             // never run two responders at once
+            if (ip == null) { Log.w(TAG, "mDNS: no IPv4 address yet — will retry on network change"); return@execute }
+            try {
+                // Bind to this interface explicitly; letting JmDNS pick can land it on a
+                // virtual/secondary interface the viewer isn't on.
+                val jm = javax.jmdns.JmDNS.create(java.net.InetAddress.getByName(ip), name)
+                // Unique instance name (short id) so both phones are discoverable; the full
+                // "id" TXT is the stable slot key; "ip" TXT is the current address to dial.
+                val info = javax.jmdns.ServiceInfo.create(
+                    "$NSD_TYPE.local.", name, LISTEN_PORT, 0, 0,
+                    hashMapOf("id" to deviceId, "ip" to ip)
+                )
+                jm.registerService(info)
+                jmdns = jm
+                mdnsRegistered = true
+                Log.w(TAG, "mDNS registered via JmDNS: $name on $ip")
+                runOnUiThread { if (server != null && !locked) statusText.text = "Waiting for viewer…" }
+            } catch (e: Exception) {
+                mdnsRegistered = false
+                Log.e(TAG, "mDNS register failed: $e")
+            }
+        }
+    }
+
+    // Coalesced re-announce: unregister, then register once after a short debounce. All
+    // re-registration (viewer disconnect, network change, IP change) goes through here so
+    // rapid triggers collapse into a single clean refresh instead of thrashing NSD.
+    private val mdnsRefreshRunnable = Runnable {
+        if (server == null) return@Runnable
+        Log.w(TAG, "mDNS refresh (ip=${localIpv4()})")
+        unregisterMdns()
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            if (server != null) registerMdns()
+        }, 300L)
+    }
+
+    private fun scheduleMdnsRefresh(delayMs: Long = 800L) {
+        watchdogHandler.removeCallbacks(mdnsRefreshRunnable)
+        watchdogHandler.postDelayed(mdnsRefreshRunnable, delayMs)
+    }
+
+    private fun unregisterMdns() {
+        mdnsExecutor.execute { closeJmdns() }
+    }
+
+    // Always called on mdnsExecutor.
+    private fun closeJmdns() {
+        val jm = jmdns ?: return
+        jmdns = null
+        mdnsRegistered = false
+        try { jm.unregisterAllServices() } catch (_: Exception) {}
+        try { jm.close() } catch (_: Exception) {}
+        Log.w(TAG, "mDNS unregistered (JmDNS closed)")
+    }
+
+    private fun registerNetworkListener() {
+        networkCallbackActive = false
+        watchdogHandler.postDelayed(networkActivateRunnable, 5_000L)
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                if (!networkCallbackActive || server == null) return
+                Log.w(TAG, "WiFi reconnected — refreshing mDNS and clearing stale connection")
+                runOnUiThread {
+                    val srv = server ?: return@runOnUiThread
+                    // Drop any active socket (its address may be stale); mDNS re-announce
+                    // happens via onViewerDisconnected → scheduleMdnsRefresh, else directly.
+                    if (srv.hasActiveConnection()) srv.forceDisconnect() else scheduleMdnsRefresh()
+                }
+            }
+
+            // Fires when the link's addresses change (e.g. Wi-Fi roam / DHCP renew), which
+            // onAvailable does NOT catch. If our IP moved, re-advertise so the viewer dials
+            // the new address instead of the stale one.
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                if (server == null) return
+                val current = localIpv4()
+                if (current != null && current != advertisedIp) {
+                    Log.w(TAG, "IP changed $advertisedIp -> $current — re-advertising mDNS")
+                    scheduleMdnsRefresh()
+                }
+            }
+        }
+        networkCallback = cb
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .build()
+        try {
+            getSystemService(ConnectivityManager::class.java).registerNetworkCallback(request, cb)
+            Log.w(TAG, "network listener registered")
+        } catch (e: Exception) {
+            Log.e(TAG, "failed to register network callback: $e")
+        }
+    }
+
+    private fun unregisterNetworkListener() {
+        networkCallbackActive = false
+        watchdogHandler.removeCallbacks(networkActivateRunnable)
+        networkCallback?.let { cb ->
+            try { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(cb) }
+            catch (_: Exception) {}
+            networkCallback = null
+        }
+    }
+
+    private fun startStreaming() {
+        if (server != null) return
+        val previous = active
+        if (previous != null && previous !== this) {
+            // A previous/orphaned instance still owns the camera + port 5054 (streaming in the
+            // background). Tear it down — the stop() blocks on the camera close, so do it off
+            // the main thread — then start fresh. Guarantees a clean start every launch.
+            Log.w(TAG, "startStreaming: tearing down previous instance for a clean start")
+            Thread({
+                try { previous.stopStreaming() } catch (e: Exception) { Log.e(TAG, "orphan teardown: $e") }
+                runOnUiThread { if (server == null && !isFinishing) startStreamingClean() }
+            }, "epoc-orphan-teardown").start()
+            return
+        }
+        startStreamingClean()
+    }
+
+    private fun startStreamingClean() {
+        if (server != null) return
+        active = this
+        startForegroundService(Intent(this, StreamingService::class.java))
+        val wm = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "epoccam_stream").also { it.acquire() }
+        multicastLock = wm.createMulticastLock("epoccam_multicast").also {
+            it.setReferenceCounted(false)
+            it.acquire()
+            Log.w(TAG, "multicast lock acquired (held=${it.isHeld})")
+        }
+        val capPkt = Protocol.buildCapabilityPacket(desiredFps)
+        server = StreamingServer(
+            onStatus = { msg ->
+                runOnUiThread {
+                    val connected = msg.startsWith("Viewer connected")
+                    statusText.text = if (connected) "Viewer connected" else msg
+                    statusText.setTextColor(if (connected) 0xFF00FF00.toInt() else 0xFFFFFFFF.toInt())
+                    notConnectedBanner.visibility = if (connected) View.GONE else View.VISIBLE
+                    if (connected) {
+                        sendBatteryReport()   // don't leave the viewer blank for up to a minute
+                        sendFocusState()      // so the viewer's focus button starts in sync
+                        sendStabilizationState()
+                        sendFpsState()        // so the viewer's frame-rate menu starts in sync
+                        sendCameraState()
+                    }
+                }
+            },
+            onFormatSelect     = { idx -> onFormatSelected(idx) },
+            // Not runOnUiThread: this rebuilds the encoder, and CameraEncoder.stop() blocks
+            // on the camera close — on the main thread that freezes the preview on its last
+            // frame and stalls reconnect handling until the close finally returns. Runs on
+            // the socket's receive thread, exactly like the resolution change it mirrors.
+            onFpsSelect        = { f -> onFpsSelected(f) },
+            // Same as onFpsSelect: rebuilds the encoder, so it stays off the main thread.
+            onCameraSelect     = { front -> onCameraSelected(front) },
+            onTorch            = { on -> encoder?.setTorch(on) },
+            onFocusCommand     = { cmd -> onFocusCommandFromViewer(cmd) },
+            onStabilization    = { on -> runOnUiThread {
+                desiredEIS = on; encoder?.setEIS(on); sendStabilizationState() } },
+            onViewerDisconnect = { onViewerDisconnected() },
+            capabilityPacket   = capPkt
+        ).also { it.start() }
+        encoder = CameraEncoder(
+            context       = this,
+            previewHolder = null,  // surfaceChanged delivers the holder once surface is ready
+            width         = FORMATS[currentFmt].first,
+            height        = FORMATS[currentFmt].second,
+            fps           = desiredFps,
+            bitrate       = BITRATES[currentFmt],
+            initialEIS    = desiredEIS,
+            useFrontCamera = desiredFront,
+            onNalUnit     = ::onNalUnit
+        ).also { it.start() }
+        // The first encoder, so the phone's own focus button reflects the camera that just
+        // opened instead of the layout's optimistic "auto focus" label.
+        resetFocusAfterRebuild()
+        registerMdns()
+        watchdogHandler.postDelayed(watchdogRunnable, 3_000L)
+        watchdogHandler.postDelayed(batteryReportRunnable, 60_000L)
+        registerNetworkListener()
+    }
+
+    @Synchronized
+    private fun stopStreaming() {
+        if (active === this) active = null
+        unregisterNetworkListener()
+        watchdogHandler.removeCallbacks(watchdogRunnable)
+        watchdogHandler.removeCallbacks(mdnsRefreshRunnable)
+        watchdogHandler.removeCallbacks(batteryReportRunnable)
+        unregisterMdns()
+        // Capture-then-null so a concurrent stop (orphan teardown + onDestroy) is a no-op.
+        val e = encoder; encoder = null
+        val s = server;  server  = null
+        val w = wifiLock; wifiLock = null
+        val ml = multicastLock; multicastLock = null
+        e?.stop()    // blocks until the camera HAL confirms close (frees it for the next start)
+        s?.stop()
+        try { w?.release() } catch (_: Exception) {}
+        try { ml?.release() } catch (_: Exception) {}
+    }
+
+    private fun onNalUnit(data: ByteArray, offset: Int, size: Int, isSps: Boolean) {
+        if (isSps) {
+            val raw = data.copyOfRange(offset, offset + size)
+            val nalType = findFirstNalByte(data, offset, size).let { if (it >= 0) data[it].toInt() and 0x1F else -1 }
+            if (nalType == 7) {
+                // SPS: strip VUI (prevents FFmpeg CPB-buffering); returns with 3-byte start code.
+                codecConfig = SpsUtil.stripVui(raw)
+                Log.w(TAG, "SPS stored ${codecConfig?.size}B")
+            } else {
+                // PPS (or other config NAL): normalize to 3-byte start code and append.
+                val norm = if (raw.size >= 4 && raw[0]==0.toByte() && raw[1]==0.toByte() &&
+                               raw[2]==0.toByte() && raw[3]==1.toByte())
+                    raw.copyOfRange(1, raw.size) else raw
+                codecConfig = (codecConfig ?: ByteArray(0)) + norm
+            }
+            return
+        }
+
+        if (!formatSelected.get()) return
+        val srv = server ?: return
+        val cfg = codecConfig ?: return  // drop frames from old encoder until new SPS arrives
+        val nalHeaderIdx = findFirstNalByte(data, offset, size)
+        val isIdr = nalHeaderIdx >= 0 && (data[nalHeaderIdx].toInt() and 0x1F) == 5
+        if (isIdr) lastKeyframeMs = android.os.SystemClock.elapsedRealtime()  // healthy keyframe flow
+        if (isIdr && configSent.compareAndSet(false, true)) {
+            // Match iPhone wire protocol exactly:
+            // 1. 4-byte pre-packet (00 00 00 05) — signals decoder reset to viewer
+            // 2. SPS+PPS+IDR bundled in one regular video packet (flags=0, not flags=8)
+            srv.enqueue(Protocol.buildHeader(4, 0xFFFFFFFFL) + byteArrayOf(0, 0, 0, 5))
+            val skip = if (size >= 4 && data[offset]==0.toByte() && data[offset+1]==0.toByte() &&
+                          data[offset+2]==0.toByte() && data[offset+3]==1.toByte()) 1 else 0
+            val idrData = data.copyOfRange(offset + skip, offset + size)
+            val bundle = cfg + idrData  // SPS+PPS (3-byte SC) + IDR (3-byte SC)
+            val hdr = Protocol.buildHeader(bundle.size, 0xFFFFFFFFL)
+            val pkt = ByteArray(28 + bundle.size)
+            System.arraycopy(hdr, 0, pkt, 0, 28)
+            System.arraycopy(bundle, 0, pkt, 28, bundle.size)
+            Log.w(TAG, "bundled SPS+PPS+IDR: ${bundle.size}B (cfg=${cfg.size}B idr=${idrData.size}B)")
+            srv.configPacket = pkt
+            srv.enqueue(pkt)
+            return  // IDR already included in bundle; don't also send it via sendNalPacket
+        }
+        sendNalPacket(srv, data, offset, size)
+    }
+
+    private fun sendNalPacket(srv: StreamingServer, data: ByteArray, offset: Int, size: Int) {
+        val skip = if (size >= 4 &&
+            data[offset] == 0.toByte() && data[offset+1] == 0.toByte() &&
+            data[offset+2] == 0.toByte() && data[offset+3] == 1.toByte()) 1 else 0
+        val nalData = data.copyOfRange(offset + skip, offset + size)
+        val hdr = Protocol.buildHeader(nalData.size, 0xFFFFFFFFL,
+            cameraFlags = if (encoder?.facingFront == true) 0x10 else 0)
+        val packet = ByteArray(28 + nalData.size)
+        System.arraycopy(hdr, 0, packet, 0, 28)
+        System.arraycopy(nalData, 0, packet, 28, nalData.size)
+        srv.enqueue(packet)
+    }
+
+    private fun findFirstNalByte(data: ByteArray, offset: Int, size: Int): Int {
+        val limit = offset + size; var i = offset
+        while (i < limit - 3) {
+            if (data[i] == 0.toByte() && data[i+1] == 0.toByte()) {
+                if (data[i+2] == 1.toByte()) return i + 3
+                if (data[i+2] == 0.toByte() && i + 3 < limit && data[i+3] == 1.toByte()) return i + 4
+            }
+            i++
+        }
+        return -1
+    }
+
+    private val unlockPollHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val unlockPollRunnable = object : Runnable {
+        override fun run() {
+            if (!locked) return
+            val am = getSystemService(ActivityManager::class.java)
+            val state = am.getLockTaskModeState()
+            if (state == ActivityManager.LOCK_TASK_MODE_PINNED ||
+                state == ActivityManager.LOCK_TASK_MODE_LOCKED) {
+                pinningConfirmed = true
+            } else if (state == ActivityManager.LOCK_TASK_MODE_NONE && pinningConfirmed) {
+                disableLock()
+                return
+            }
+            unlockPollHandler.postDelayed(this, 500)
+        }
+    }
+
+    private fun enableLock() {
+        locked = true
+        pinningConfirmed = false
+        lockButton.visibility = View.GONE
+        lockedBadge.visibility = View.VISIBLE
+        startLockTask()
+        unlockPollHandler.postDelayed(unlockPollRunnable, 500)
+    }
+
+    private fun disableLock() {
+        locked = false
+        unlockPollHandler.removeCallbacks(unlockPollRunnable)
+        lockedBadge.visibility = View.GONE
+        lockButton.visibility = View.VISIBLE
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (locked) return true
+        return super.dispatchTouchEvent(ev)
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (locked) return true
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        if (locked) return true
+        return super.onKeyUp(keyCode, event)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try { unregisterReceiver(batteryReceiver) } catch (_: Exception) {}
+        if (isFinishing) {
+            stopService(Intent(this, StreamingService::class.java))
+            stopStreaming()
+        }
+    }
+}

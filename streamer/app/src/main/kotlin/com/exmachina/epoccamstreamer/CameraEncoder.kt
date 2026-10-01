@@ -1,0 +1,727 @@
+package com.exmachina.epoccamstreamer
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.graphics.ImageFormat
+import android.hardware.HardwareBuffer
+import android.hardware.camera2.*
+import android.media.Image
+import android.media.ImageReader
+import android.media.ImageWriter
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaCodecList
+import android.media.MediaFormat
+import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
+import android.util.Log
+import android.view.Surface
+import android.view.SurfaceHolder
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+
+private const val TAG = "CameraEncoder"
+
+// The two frame rates the viewer can pick between. 60 measured ~33ms (one 30fps frame
+// interval) off end-to-end latency on a Pixel 5 at 720p, at the cost of halving per-frame
+// quality for the same CBR bitrate — worth it for some material and not others, hence a
+// per-camera setting rather than a hardcoded rate.
+// How long to wait for a real *_LOCKED state before accepting a passive AF verdict instead.
+private const val PASSIVE_AF_GRACE_MS = 1_500L
+
+const val DEFAULT_FPS = 30
+const val HIGH_FPS = 60
+
+class CameraEncoder(
+    private val context: Context,
+    @Volatile var previewHolder: SurfaceHolder?,
+    private val width: Int,
+    private val height: Int,
+    private val fps: Int,
+    private val bitrate: Int,
+    // Carried across encoder rebuilds (a resolution change constructs a new CameraEncoder),
+    // so stabilization isn't silently lost whenever the format changes.
+    initialEIS: Boolean = false,
+    // Which physical camera to open. Switching is a full rebuild: the camera device itself
+    // changes, so there is nothing to reconfigure on the running session.
+    private val useFrontCamera: Boolean = false,
+    private val onNalUnit: (data: ByteArray, offset: Int, size: Int, isSps: Boolean) -> Unit
+) {
+    private val running = AtomicBoolean(false)
+    private var cameraCloseLatch: CountDownLatch? = null
+
+    private var cameraDevice: CameraDevice? = null
+    private var captureSession: CameraCaptureSession? = null
+    private var encoder: MediaCodec? = null
+    private var encoderSurface: Surface? = null
+
+    // On API 29+ the camera targets imageReader instead of the encoder's input surface
+    // directly — see the giant comment in start() for why. captureSurface is whichever of
+    // the two the camera is actually targeting; buildRequest()/startCapture() etc. only
+    // ever touch captureSurface, never encoderSurface directly.
+    private var imageReader: ImageReader? = null
+    private var imageWriter: ImageWriter? = null
+    private var captureSurface: Surface? = null
+
+    private val cameraThread = HandlerThread("epoc-camera").also { it.start() }
+    private val cameraHandler = Handler(cameraThread.looper)
+
+    @Volatile private var hasFlash = false
+    // Optical stabilization is free: it moves a lens element, so there is no crop and no
+    // frame buffering. Enabled whenever the camera offers it, with no toggle.
+    @Volatile var hasOIS = false; private set
+    // Electronic stabilization crops and, more importantly, buffers frames to look ahead at
+    // motion — so it can cost real latency. Off by default and driven from the viewer so the
+    // penalty can be measured rather than assumed.
+    @Volatile var hasEIS = false; private set
+    // Not every camera can focus. A fixed-focus front camera (the S7-class ones) accepts only
+    // CONTROL_AF_MODE_OFF and reports CONTROL_AF_STATE as null, so a focus request never
+    // reports a lock: the operator gets "focusing…" timing out into "manual focus?" rather
+    // than being told the camera simply cannot do it. Read from the HAL and reported to the
+    // viewer, exactly as flash, EIS and 60fps already are.
+    @Volatile var hasAutoFocus = false; private set
+    @Volatile private var eisOn = initialEIS
+    val eisEnabled: Boolean get() = eisOn
+    // Not every camera can sustain 60fps, and CONTROL_AE_TARGET_FPS_RANGE only accepts a
+    // range the HAL actually advertises — asking for one it doesn't list fails session
+    // configuration outright (a black preview, the failure mode we already fight on the
+    // older Exynos phones). So the request is clamped to what this device really offers and
+    // the viewer is told the rate it actually got, rather than the one it asked for.
+    // What this device actually offers, and which way we ended up facing — a phone with no
+    // front camera, or one that fails to open it, still has to stream rather than die.
+    @Volatile var hasFrontCamera = false; private set
+    @Volatile var hasBackCamera = false; private set
+    @Volatile var facingFront = useFrontCamera; private set
+    @Volatile var supportsHighFps = false; private set
+    @Volatile var activeFps = fps; private set
+    private var fpsRange: android.util.Range<Int> = android.util.Range(fps, fps)
+    private val drainThread = Thread({ drainLoop() }, "epoc-drain")
+    @Volatile private var nalLogCount = 0
+
+    // Camera LED (torch), driven from the viewer. Applied through the repeating request
+    // rather than CameraManager.setTorchMode(), which is not usable while we own the camera.
+    @Volatile private var torchOn = false
+
+    // AF state. Both modes are resolved from CONTROL_AF_AVAILABLE_MODES once the camera is
+    // open, rather than assumed: asking for a mode the HAL does not advertise is silently
+    // ignored, the lens never moves, and the result is indistinguishable from a broken
+    // feature. CONTINUOUS_VIDEO in particular is not universal — some front cameras list
+    // only CONTINUOUS_PICTURE, or only AUTO.
+    @Volatile private var continuousAfMode = CaptureRequest.CONTROL_AF_MODE_OFF
+    // The one-shot lock behind manual focus. Needs AF_MODE_AUTO; without it there is no lock
+    // to take, which is what hasAutoFocus reports.
+    @Volatile private var oneShotAfMode = CaptureRequest.CONTROL_AF_MODE_OFF
+    @Volatile private var currentAfApiMode = CaptureRequest.CONTROL_AF_MODE_OFF
+    private val afStateListener = AtomicReference<((Int) -> Unit)?>(null)
+
+    // Rate-limited: what the HAL *actually applied*, which is not necessarily what we asked
+    // for. A request for video stabilization can be silently ignored — the result is the only
+    // way to tell "the HAL refused" from "it is on but the effect is subtle".
+    @Volatile private var lastStabLogMs = 0L
+
+    private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastStabLogMs > 3000) {
+                lastStabLogMs = now
+                Log.w(TAG, "APPLIED: videoStab=${result.get(CaptureResult.CONTROL_VIDEO_STABILIZATION_MODE)}" +
+                           " (requested=${request.get(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE)})" +
+                           " ois=${result.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE)}" +
+                           " (requested=${request.get(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE)})")
+            }
+            val state = result.get(CaptureResult.CONTROL_AF_STATE) ?: return
+            afStateListener.get()?.invoke(state)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun start() {
+        if (!running.compareAndSet(false, true)) return
+        Log.w(TAG, "start() w=$width h=$height bitrate=$bitrate")
+
+        val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        fun facing(id: String) = manager.getCameraCharacteristics(id)
+            .get(CameraCharacteristics.LENS_FACING)
+        val frontId = manager.cameraIdList.firstOrNull {
+            facing(it) == CameraCharacteristics.LENS_FACING_FRONT }
+        val backId  = manager.cameraIdList.firstOrNull {
+            facing(it) == CameraCharacteristics.LENS_FACING_BACK }
+        hasFrontCamera = frontId != null
+        hasBackCamera  = backId != null
+        // Fall back to whatever exists rather than failing: report back what was actually
+        // opened so the viewer's button reflects the real camera, not the requested one.
+        val cameraId = (if (useFrontCamera) frontId ?: backId else backId ?: frontId)
+            ?: manager.cameraIdList[0]
+        facingFront = facing(cameraId) == CameraCharacteristics.LENS_FACING_FRONT
+        Log.w(TAG, "camera=$cameraId facingFront=$facingFront " +
+                   "(front=$frontId back=$backId requested=${if (useFrontCamera) "front" else "back"})")
+        val chars = manager.getCameraCharacteristics(cameraId)
+        hasFlash = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+        // Both characteristics are int[] in the Java API (dumpsys shows the HAL's byte[]).
+        hasOIS = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+            ?.any { it == CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON } == true
+        hasEIS = chars.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+            ?.any { it == CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON } == true
+        // Which AF modes this camera really has, and hence whether manual focus is offerable
+        // at all. CONTROL_AF_AVAILABLE_MODES is the authority: it is mandatory metadata at
+        // every hardware level, and is documented to contain AF_MODE_AUTO whenever the device
+        // can autofocus and nothing but OFF on a fixed-focus lens.
+        //
+        // LENS_INFO_MINIMUM_FOCUS_DISTANCE is logged but deliberately *not* part of the
+        // decision. A value of 0 also means "fixed focus", but it is optional metadata below
+        // hardware level FULL and so may be absent or simply wrong — and getting it wrong
+        // here disables a focus control that works, which is worse than the bug being fixed.
+        // If a phone turns out to lie in its mode list, the log line below will show it.
+        val afModes = chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: IntArray(0)
+        val minFocusDist = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+        fun firstAfMode(vararg wanted: Int) = wanted.firstOrNull { afModes.contains(it) }
+        continuousAfMode = firstAfMode(
+            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO,
+            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
+            CaptureRequest.CONTROL_AF_MODE_AUTO) ?: CaptureRequest.CONTROL_AF_MODE_OFF
+        // Manual focus is a one-shot lock, which needs AF_MODE_AUTO: a camera offering only
+        // a continuous mode can focus but cannot hold it, so there is no lock to offer.
+        oneShotAfMode = firstAfMode(CaptureRequest.CONTROL_AF_MODE_AUTO)
+            ?: CaptureRequest.CONTROL_AF_MODE_OFF
+        hasAutoFocus = oneShotAfMode != CaptureRequest.CONTROL_AF_MODE_OFF
+        currentAfApiMode = continuousAfMode
+        val aeRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+        supportsHighFps = pickFpsRange(aeRanges, HIGH_FPS) != null
+        // Fall back rather than fail: a phone that can't do the requested rate still streams.
+        val wanted = if (fps >= HIGH_FPS && !supportsHighFps) DEFAULT_FPS else fps
+        fpsRange = pickFpsRange(aeRanges, wanted) ?: android.util.Range(wanted, wanted)
+        activeFps = fpsRange.upper
+        Log.w(TAG, "flash=$hasFlash OIS=$hasOIS EIS=$hasEIS " +
+                   "fps=$activeFps range=$fpsRange high60=$supportsHighFps " +
+                   "advertised=${aeRanges?.joinToString()}")
+        Log.w(TAG, "AF: hasAutoFocus=$hasAutoFocus continuous=$continuousAfMode " +
+                   "oneShot=$oneShotAfMode minFocusDist=$minFocusDist " +
+                   "availableModes=${afModes.joinToString()}")
+
+        val allCodecs = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
+        allCodecs.filter { it.isEncoder && it.supportedTypes.any { t -> t == "video/avc" } }
+            .forEach { Log.w(TAG, "h264 encoder: ${it.name}") }
+
+        val format = MediaFormat.createVideoFormat("video/avc", width, height).apply {
+            setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
+            setInteger(MediaFormat.KEY_FRAME_RATE, activeFps)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1) // auto keyframe every 1s: instant viewer join + loss recovery
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileMain)
+            setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
+            // Left unset, this encoder defaults to VBR (confirmed via outputFormat's
+            // "bitrate-mode=1"), which needs to look ahead across future frames to decide bit
+            // allocation — exactly the kind of frame-buffering that adds pipeline latency, and
+            // vendors vary widely in how deep that look-ahead runs. CBR can make its decision
+            // frame-by-frame with no look-ahead, which is why real-time encoders request it.
+            setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+            // Some hardware encoders (notably Qualcomm's) hold several frames in an internal
+            // look-ahead/rate-control pipeline by default, adding real latency before a frame
+            // ever reaches drainLoop(). This asks the encoder to target ~1 frame of internal
+            // buffering instead. Ignored by encoders that don't support the hint.
+            setInteger(MediaFormat.KEY_LATENCY, 1)
+            // Qualcomm's Codec2 AVC encoder (c2.qti.avc.encoder) ignores the generic
+            // KEY_LATENCY hint above but honors this vendor extension to disable its
+            // internal rate-control look-ahead. Harmless no-op on encoders that don't
+            // recognize it (e.g. Exynos).
+            setInteger("vendor.qti-ext-enc-low-latency.enable", 1)
+        }
+        val enc = MediaCodec.createEncoderByType("video/avc")
+        enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        val encSurface = enc.createInputSurface()
+        encoderSurface = encSurface
+        enc.start()
+        encoder = enc
+        drainThread.start()
+
+        // Feeding the camera directly into MediaCodec.createInputSurface() is the documented,
+        // "recommended" zero-copy path — but on Qualcomm-based devices (confirmed on a Pixel 5;
+        // see https://issuetracker.google.com/issues/254027327, closed "Won't Fix (Obsolete)" by
+        // Google without a platform fix) that input surface's underlying HardwareBuffer usage
+        // flag (USAGE_VIDEO_ENCODE) puts the driver into a mode that holds ~1s of frames,
+        // independent of any MediaCodec/CaptureRequest configuration — matches what we measured
+        // directly here (PIPE LATENCY stayed ~500ms through four different encoder/capture
+        // tunables). Routing frames through ImageReader -> ImageWriter instead avoids that flag
+        // while remaining a zero-copy GPU buffer handoff (the fix confirmed in that bug thread).
+        //
+        // Restricted to Qualcomm hardware on purpose: the workaround is for a Qualcomm driver
+        // quirk, and it actively breaks other vendors — on a Samsung Exynos S6 (which is also
+        // API 29, so a version-only gate wrongly enabled it) this path encodes a solid green
+        // frame, even though the phone's own preview stays correct. Everything else keeps the
+        // direct-Surface path, which those devices were already using with no latency problem.
+        // Build.SOC_MANUFACTURER is API 31+, so it's only consulted on devices that have it;
+        // Build.HARDWARE ("qcom") covers the rest, including the API 29 devices in play here.
+        val soc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) Build.SOC_MANUFACTURER else ""
+        val isQualcomm = Build.HARDWARE.startsWith("qcom", ignoreCase = true) ||
+                         soc.equals("QTI", ignoreCase = true) ||
+                         soc.contains("Qualcomm", ignoreCase = true)
+        Log.w(TAG, "capture path: hardware=${Build.HARDWARE} soc=$soc isQualcomm=$isQualcomm")
+        captureSurface = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && isQualcomm) {
+            try {
+                // maxImages=1 was tried here to trim a possible frame of queuing depth — measured
+                // no change in PIPE LATENCY at all, confirming the ~90-100ms floor is intrinsic
+                // to the sensor/ISP/encode stages, not this queue. Kept at the safer 2 since 1
+                // bought nothing.
+                val writer = ImageWriter.newInstance(encSurface, 2, ImageFormat.PRIVATE)
+                // USAGE_VIDEO_ENCODE is required for electronic stabilization: the HAL only
+                // applies EIS to a stream marked for video encoding. It accepts the request
+                // either way (CaptureResult reports videoStab=1), but silently does nothing
+                // without this flag — no crop, no smoothing.
+                //
+                // Crucially this does NOT bring back the ~500ms Qualcomm stall. That bug is
+                // specific to MediaCodec.createInputSurface(), not to the usage flag: with the
+                // flag on this ImageReader, and the encoder still fed via ImageWriter,
+                // measured latency stays ~85ms while EIS works. Verified on a Pixel 5.
+                val reader = ImageReader.newInstance(
+                    width, height, ImageFormat.PRIVATE, 2,
+                    HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_VIDEO_ENCODE
+                )
+                reader.setOnImageAvailableListener({ r ->
+                    val image: Image = try { r.acquireLatestImage() } catch (e: Exception) {
+                        Log.w(TAG, "acquireLatestImage failed: $e"); null
+                    } ?: return@setOnImageAvailableListener
+                    try {
+                        writer.queueInputImage(image)  // takes ownership of image on success
+                    } catch (e: Exception) {
+                        Log.w(TAG, "queueInputImage failed: $e")
+                        image.close()
+                    }
+                }, cameraHandler)
+                imageWriter = writer
+                imageReader = reader
+                Log.w(TAG, "using ImageReader/ImageWriter path (avoids Surface-input encoder latency)")
+                reader.surface
+            } catch (e: Exception) {
+                Log.w(TAG, "ImageReader/ImageWriter setup failed, falling back to direct Surface: $e")
+                encSurface
+            }
+        } else {
+            encSurface
+        }
+
+        manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+            override fun onOpened(camera: CameraDevice) {
+                Log.w(TAG, "onOpened running=${running.get()}")
+                if (!running.get()) { camera.close(); return }
+                cameraDevice = camera
+                startCapture(camera)
+            }
+            override fun onDisconnected(camera: CameraDevice) {
+                Log.w(TAG, "onDisconnected")
+                camera.close(); cameraDevice = null
+            }
+            override fun onError(camera: CameraDevice, error: Int) {
+                Log.e(TAG, "onError $error"); camera.close(); cameraDevice = null
+            }
+            override fun onClosed(camera: CameraDevice) {
+                Log.w(TAG, "camera onClosed")
+                cameraCloseLatch?.countDown()
+            }
+        }, cameraHandler)
+    }
+
+    // Pick an advertised AE range that delivers `target`. A fixed [t,t] range is preferred:
+    // it stops AE from dropping the rate (and lengthening exposure) in dim light, which is
+    // both a latency and a smoothness cost. Falls back to any range topping out at the
+    // target, then gives up so the caller can clamp.
+    private fun pickFpsRange(ranges: Array<android.util.Range<Int>>?, target: Int)
+            : android.util.Range<Int>? {
+        if (ranges == null) return null
+        return ranges.firstOrNull { it.lower == target && it.upper == target }
+            ?: ranges.filter { it.upper == target }.minByOrNull { it.lower }
+    }
+
+    private fun buildRequest(
+        camera: CameraDevice,
+        preview: Surface?,
+        enc: Surface,
+        afMode: Int,
+        afTrigger: Int = CaptureRequest.CONTROL_AF_TRIGGER_IDLE
+    ) = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+        preview?.let { addTarget(it) }
+        addTarget(enc)
+        set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+        // AE_MODE_ON (rather than an ON_AUTO_FLASH variant) is required for FLASH_MODE to be
+        // honoured — the auto-flash modes drive the LED themselves and ignore it.
+        set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+        set(CaptureRequest.FLASH_MODE,
+            if (torchOn) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF)
+        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
+        // TEMPLATE_RECORD is documented to disable ZSL, but some HALs (notably Pixel's) still
+        // run a ring-buffer/multi-frame pipeline on the record output. Explicit belt-and-braces.
+        set(CaptureRequest.CONTROL_ENABLE_ZSL, false)
+        set(CaptureRequest.CONTROL_AF_MODE, afMode)
+        set(CaptureRequest.CONTROL_AF_TRIGGER, afTrigger)
+        set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_FAST)
+        set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
+        set(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_OFF)
+        // OIS on whenever the hardware has it: optical, so no crop and no added latency.
+        if (hasOIS) {
+            set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
+        }
+        set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+            if (eisOn && hasEIS) CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
+            else CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+        set(CaptureRequest.SHADING_MODE, CaptureRequest.SHADING_MODE_OFF)
+        set(CaptureRequest.HOT_PIXEL_MODE, CaptureRequest.HOT_PIXEL_MODE_OFF)
+        set(CaptureRequest.TONEMAP_MODE, CaptureRequest.TONEMAP_MODE_FAST)
+    }.build()
+
+    private fun startCapture(camera: CameraDevice) {
+        val enc = captureSurface ?: return
+        val preview = previewHolder?.surface
+        val surfaces = listOfNotNull(preview, enc)
+        try { camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+            override fun onConfigured(session: CameraCaptureSession) {
+                if (!running.get()) { session.close(); return }
+                captureSession = session
+                try {
+                    session.setRepeatingRequest(
+                        buildRequest(camera, preview, enc, currentAfApiMode),
+                        captureCallback, cameraHandler
+                    )
+                } catch (e: Exception) {
+                    // Two distinct races, both benign, both fatal if they escape: this
+                    // callback runs on the camera thread, so an uncaught throw here kills the
+                    // process. IllegalStateException = the session was superseded by a newer
+                    // createCaptureSession before this callback fired (the newer one takes
+                    // over). CameraAccessException(CAMERA_DISCONNECTED) = the device was
+                    // closed while the configuration was in flight — buildRequest() calls
+                    // createCaptureRequest() on it, which throws once it is no longer alive.
+                    // That happens routinely when an encoder rebuild or an app stop lands
+                    // mid-configure. Every other buildRequest() call site in this file already
+                    // catches broadly; this one did not.
+                    Log.w(TAG, "onConfigured: camera gone or session superseded: $e")
+                    try { session.close() } catch (_: Exception) {}
+                }
+            }
+            override fun onConfigureFailed(session: CameraCaptureSession) {
+                Log.e(TAG, "capture session config failed")
+            }
+        }, cameraHandler) } catch (e: CameraAccessException) {
+            Log.w(TAG, "startCapture: camera disconnected before session configured: $e")
+        }
+    }
+
+    fun updatePreview(holder: SurfaceHolder?) {
+        val wasNull = previewHolder == null
+        previewHolder = holder
+        val cam = cameraDevice ?: return
+        // null→null means the surface resized during a format change where this encoder never
+        // had a preview. Restarting the session here would race with the onConfigured callback
+        // that's already coming. Let surfaceCreated deliver the first real holder instead.
+        if (wasNull && holder == null) return
+        captureSession?.close()
+        captureSession = null
+        startCapture(cam)
+        if (holder != null) requestIDR()
+    }
+
+    // Toggle the camera LED. No-op on a camera with no flash unit, which is reported so the
+    // operator can tell "the phone ignored me" from "the message never arrived".
+    fun setTorch(on: Boolean) {
+        val cam = cameraDevice ?: run { Log.w(TAG, "setTorch: no cameraDevice, ignored"); return }
+        val session = captureSession ?: run { Log.w(TAG, "setTorch: no captureSession, ignored"); return }
+        val enc = captureSurface ?: run { Log.w(TAG, "setTorch: no captureSurface, ignored"); return }
+        if (!hasFlash) { Log.w(TAG, "setTorch: this camera has no flash unit, ignored"); return }
+        torchOn = on
+        val preview = previewHolder?.surface
+        try {
+            session.setRepeatingRequest(
+                buildRequest(cam, preview, enc, currentAfApiMode), captureCallback, cameraHandler
+            )
+            Log.w(TAG, "torch ${if (on) "ON" else "OFF"}")
+        } catch (e: Exception) { Log.e(TAG, "setTorch failed: $e") }
+    }
+
+    // Electronic stabilization on/off. Re-issues the repeating request so it takes effect
+    // immediately, the same way the torch does.
+    fun setEIS(on: Boolean) {
+        // Record the intent first: a request can arrive before the capture session exists
+        // (the viewer re-applies the remembered setting the moment it connects), and
+        // buildRequest() will pick it up when the session does start.
+        eisOn = on
+        if (!hasEIS) { Log.w(TAG, "setEIS: camera has no video stabilization, ignored"); return }
+        val cam = cameraDevice ?: run { Log.w(TAG, "setEIS: deferred until the session starts"); return }
+        val session = captureSession ?: run { Log.w(TAG, "setEIS: deferred until the session starts"); return }
+        val enc = captureSurface ?: run { Log.w(TAG, "setEIS: deferred until the session starts"); return }
+        val preview = previewHolder?.surface
+        try {
+            session.setRepeatingRequest(
+                buildRequest(cam, preview, enc, currentAfApiMode), captureCallback, cameraHandler
+            )
+            Log.w(TAG, "EIS ${if (on) "ON" else "OFF"}")
+        } catch (e: Exception) { Log.e(TAG, "setEIS failed: $e") }
+    }
+
+    fun setContinuousAf() {
+        if (continuousAfMode == CaptureRequest.CONTROL_AF_MODE_OFF) {
+            Log.w(TAG, "setContinuousAf: this camera is fixed-focus, ignored"); return
+        }
+        currentAfApiMode = continuousAfMode
+        afStateListener.set(null)
+        val cam = cameraDevice ?: run { Log.w(TAG, "setContinuousAf: no cameraDevice, ignored"); return }
+        val session = captureSession ?: run { Log.w(TAG, "setContinuousAf: no captureSession, ignored"); return }
+        val enc = captureSurface ?: run { Log.w(TAG, "setContinuousAf: no captureSurface, ignored"); return }
+        val preview = previewHolder?.surface
+        try {
+            // Explicitly cancel the active trigger/lock before resuming continuous AF — on this
+            // HAL, just changing CONTROL_AF_MODE back to CONTINUOUS_VIDEO isn't enough to release
+            // it: the lens stays parked at its locked position (confirmed by direct testing: the
+            // repeating request below was already being sent successfully, but focus never
+            // actually resumed moving until this cancel was added).
+            session.capture(
+                buildRequest(cam, preview, enc, continuousAfMode,
+                    CaptureRequest.CONTROL_AF_TRIGGER_CANCEL),
+                null, cameraHandler
+            )
+            session.setRepeatingRequest(
+                buildRequest(cam, preview, enc, continuousAfMode),
+                captureCallback, cameraHandler
+            )
+        } catch (e: Exception) { Log.e(TAG, "setContinuousAf failed: $e") }
+    }
+
+    // Returns false when the lock was never started, so the caller can leave its UI alone
+    // instead of showing "focusing…" for a convergence that will never be reported. A
+    // fixed-focus camera is the main case: CONTROL_AF_STATE comes back null there, so the
+    // listener below would never fire and the operator would wait out the caller's timeout.
+    fun triggerAfAndLock(onDone: (focused: Boolean) -> Unit): Boolean {
+        if (!hasAutoFocus) {
+            Log.w(TAG, "triggerAfAndLock: this camera is fixed-focus, ignored"); return false
+        }
+        val cam = cameraDevice ?: run { Log.w(TAG, "triggerAfAndLock: no cameraDevice, ignored"); return false }
+        val session = captureSession ?: run { Log.w(TAG, "triggerAfAndLock: no captureSession, ignored"); return false }
+        val enc = captureSurface ?: run { Log.w(TAG, "triggerAfAndLock: no captureSurface, ignored"); return false }
+        val preview = previewHolder?.surface
+        currentAfApiMode = oneShotAfMode
+        try {
+            // Cancel any prior lock so AF state machine resets
+            session.capture(
+                buildRequest(cam, preview, enc, oneShotAfMode,
+                    CaptureRequest.CONTROL_AF_TRIGGER_CANCEL),
+                null, cameraHandler
+            )
+            // Arm listener before triggering
+            var reported = false
+            var lastState = -1
+            // Some HALs accept the one-shot mode and then never deliver a *_LOCKED state: the
+            // Galaxy S8's front camera runs its continuous AF instead and settles into
+            // PASSIVE_FOCUSED/PASSIVE_UNFOCUSED. The lens really does focus, so timing out and
+            // reporting "couldn't confirm" is wrong — but a passive state cannot simply be
+            // accepted, because a camera that *does* lock passes through PASSIVE_FOCUSED on
+            // the way (the S8's rear camera goes 2 -> 0 -> 3 -> 4). Taking it immediately
+            // would call the lock done before the lens had settled.
+            //
+            // So: always prefer a real lock, and only fall back to the last passive verdict if
+            // none has arrived by the time this grace window expires — comfortably inside the
+            // caller's 4s timeout, so a HAL like this resolves in about a second instead of
+            // timing out.
+            // "Did the lens ever reach focus during this attempt", not "what was it doing at
+            // the deadline". These HALs keep their continuous AF running after converging, so
+            // a successful PASSIVE_FOCUSED is routinely followed by PASSIVE_UNFOCUSED as the
+            // camera re-evaluates the scene — taking the latest value turned a focus that
+            // worked into "manual focus?".
+            var sawPassiveFocused = false
+            var anyPassive = false
+            var graceExpired = false
+            // Third HAL behaviour, the S8's front camera: it runs the scan and then returns
+            // to INACTIVE without ever reporting a verdict — no *_LOCKED, not even a passive
+            // one. There is nothing to wait for, so the old code sat on "focusing…" for the
+            // caller's full 4s timeout and then said "manual focus?" about a focus that had
+            // visibly succeeded. ACTIVE_SCAN followed by INACTIVE means the scan ran to
+            // completion, so treat that as the verdict. Cameras that do report a lock never
+            // take this path: they go scan -> *_LOCKED and finish above.
+            var sawActiveScan = false
+            fun finish(focused: Boolean) {
+                if (reported) return
+                reported = true
+                afStateListener.set(null)
+                onDone(focused)
+            }
+            // Runs on cameraHandler, the same thread as the listener below, so these flags
+            // need no synchronisation.
+            cameraHandler.postDelayed({
+                graceExpired = true
+                if (!reported && anyPassive) {
+                    Log.w(TAG, "AF: no locked state after ${PASSIVE_AF_GRACE_MS}ms, " +
+                               "passive verdict focused=$sawPassiveFocused")
+                    finish(sawPassiveFocused)
+                }
+                // Nothing passive yet (the camera is still scanning): don't force a verdict
+                // out of thin air — the listener below resolves on the next passive state
+                // instead of leaving the operator on "focusing…" until the caller's timeout.
+            }, PASSIVE_AF_GRACE_MS)
+            afStateListener.set { state ->
+                // Every transition while a lock is converging, logged once per distinct value.
+                // A camera that accepts the trigger but never reaches a *_LOCKED state — so
+                // the caller falls back to its timeout — is otherwise indistinguishable from
+                // one that ignored the request outright, and the two need different fixes.
+                if (state != lastState) {
+                    lastState = state
+                    Log.w(TAG, "AF state -> $state (mode=$oneShotAfMode)")
+                }
+                if (state == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED ||
+                    state == CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED) {
+                    anyPassive = true
+                    if (state == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED) {
+                        sawPassiveFocused = true
+                    }
+                    if (graceExpired) {
+                        Log.w(TAG, "AF: first passive state after grace, " +
+                                   "focused=$sawPassiveFocused")
+                        finish(sawPassiveFocused)
+                    }
+                }
+                if (state == CaptureResult.CONTROL_AF_STATE_ACTIVE_SCAN) sawActiveScan = true
+                if (sawActiveScan && state == CaptureResult.CONTROL_AF_STATE_INACTIVE) {
+                    Log.w(TAG, "AF: scan completed with no verdict reported, treating as focused")
+                    finish(true)
+                }
+                if (state == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                    state == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED) {
+                    finish(state == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED)
+                }
+            }
+            // One-shot trigger
+            session.capture(
+                buildRequest(cam, preview, enc, oneShotAfMode,
+                    CaptureRequest.CONTROL_AF_TRIGGER_START),
+                captureCallback, cameraHandler
+            )
+            // Repeating with AF_MODE_AUTO keeps AF locked and feeds state to the listener
+            session.setRepeatingRequest(
+                buildRequest(cam, preview, enc, oneShotAfMode),
+                captureCallback, cameraHandler
+            )
+        } catch (e: Exception) { Log.e(TAG, "triggerAfAndLock failed: $e"); return false }
+        return true
+    }
+
+    private fun drainLoop() {
+        val info = MediaCodec.BufferInfo()
+        val enc = encoder ?: return
+        var frameCount = 0
+        var lastHeartbeatMs = 0L
+        var lastNalMs = 0L
+
+        while (running.get()) {
+            val idx = try {
+                enc.dequeueOutputBuffer(info, 10_000L)
+            } catch (e: Exception) {
+                break  // encoder stopped from another thread during resolution change
+            }
+            if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                Log.w(TAG, "output format changed: ${enc.outputFormat}")
+                continue
+            }
+            if (idx < 0) continue
+
+            frameCount++
+            val now = android.os.SystemClock.uptimeMillis()
+            if (lastNalMs > 0 && now - lastNalMs > 50) {
+                Log.w(TAG, "ENCODER STALL: ${now - lastNalMs}ms (fc=$frameCount)")
+            }
+            lastNalMs = now
+            if (now - lastHeartbeatMs >= 2000) {
+                Log.w(TAG, "heartbeat: $frameCount NAL units in last 2s")
+                // presentationTimeUs is the camera-buffer timestamp propagated straight through
+                // the Surface into the encoder. Diffing it against wall clock (in both plausible
+                // clock domains — camera timestamps are elapsedRealtime-based on most devices,
+                // uptime-based on some) measures how long THIS frame sat in the camera->encoder
+                // pipe before the encoder emitted it, isolating a HAL/ISP pipeline delay from
+                // anything downstream (network/receiver).
+                val nowRealtimeUs = android.os.SystemClock.elapsedRealtimeNanos() / 1000
+                val nowUptimeUs = android.os.SystemClock.uptimeMillis() * 1000
+                Log.w(TAG, "PIPE LATENCY: pts=${info.presentationTimeUs}us " +
+                        "vsRealtime=${(nowRealtimeUs - info.presentationTimeUs) / 1000}ms " +
+                        "vsUptime=${(nowUptimeUs - info.presentationTimeUs) / 1000}ms")
+                frameCount = 0; lastHeartbeatMs = now
+            }
+
+            val buf = enc.getOutputBuffer(idx)
+            if (buf == null) { enc.releaseOutputBuffer(idx, false); continue }
+            buf.position(info.offset); buf.limit(info.offset + info.size)
+            val data = ByteArray(info.size)
+            buf.get(data)
+            enc.releaseOutputBuffer(idx, false)
+
+            val isConfig = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+            if (isConfig) Log.w(TAG, "codec config (${info.size}B): ${data.take(info.size).joinToString(" ") { "%02x".format(it) }}")
+            if (info.size > 0) splitAndDispatch(data, 0, info.size, isConfig)
+        }
+    }
+
+    private fun splitAndDispatch(data: ByteArray, offset: Int, size: Int, isConfig: Boolean) {
+        val end = offset + size
+        var nalStart = -1
+        var i = offset
+
+        fun dispatch(from: Int, to: Int) {
+            if (to <= from) return
+            var sc = from
+            while (sc < to - 1 && !(data[sc] == 0.toByte() && data[sc+1] == 0.toByte() &&
+                        (sc+2 < to && (data[sc+2] == 1.toByte() ||
+                            (data[sc+2] == 0.toByte() && sc+3 < to && data[sc+3] == 1.toByte()))))) sc++
+            val typeByte = if (sc + 3 < to && data[sc+2] == 0.toByte()) data[sc+4].toInt() and 0x1F
+                           else if (sc + 2 < to) data[sc+3].toInt() and 0x1F
+                           else -1
+            if (nalLogCount < 80 && typeByte >= 0) { nalLogCount++; Log.w(TAG, "NAL type=$typeByte size=${to-from} isConfig=$isConfig") }
+            if (typeByte == 12 || typeByte == 9 || typeByte == 6) return  // strip filler/AUD/SEI
+            if (!isConfig && (typeByte == 7 || typeByte == 8)) return
+            onNalUnit(data, from, to - from, isConfig && (typeByte == 7 || typeByte == 8))
+        }
+
+        while (i < end - 3) {
+            val is3 = data[i] == 0.toByte() && data[i+1] == 0.toByte() && data[i+2] == 1.toByte()
+            val is4 = i + 3 < end && data[i] == 0.toByte() && data[i+1] == 0.toByte() &&
+                      data[i+2] == 0.toByte() && data[i+3] == 1.toByte()
+            if (is3 || is4) {
+                if (nalStart >= 0) dispatch(nalStart, i)
+                nalStart = i
+                i += if (is4) 4 else 3
+            } else i++
+        }
+        if (nalStart >= 0) dispatch(nalStart, end)
+    }
+
+    fun requestIDR() {
+        encoder?.setParameters(android.os.Bundle().apply {
+            putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+        })
+    }
+
+    fun stop() {
+        Log.w(TAG, "stop() called w=$width h=$height")
+        running.set(false)
+        afStateListener.set(null)
+        captureSession?.close(); captureSession = null
+        val cam = cameraDevice; cameraDevice = null
+        if (cam != null) {
+            cameraCloseLatch = CountDownLatch(1)
+            cam.close()
+            // Wait for HAL to confirm camera closed before releasing encoder surface.
+            // Without this, the camera HAL keeps writing to a released surface → buffer timeout.
+            cameraCloseLatch?.await(2, TimeUnit.SECONDS)
+            cameraCloseLatch = null
+        }
+        try { imageReader?.close() } catch (_: Exception) {}
+        imageReader = null
+        try { imageWriter?.close() } catch (_: Exception) {}
+        imageWriter = null
+        captureSurface = null
+        encoderSurface?.release(); encoderSurface = null
+        try { encoder?.stop() } catch (_: Exception) {}
+        try { encoder?.release() } catch (_: Exception) {}
+        encoder = null
+        cameraThread.quitSafely()
+    }
+}
