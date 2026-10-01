@@ -1,0 +1,996 @@
+import AppKit
+import CoreVideo
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var window: NSWindow!
+    private var browser: EpocCamBrowser!
+
+    // Per-slot UI + output. Each slot owns its own Syphon server so Millumin sees
+    // two distinct sources ("EpocCam A" and "EpocCam B").
+    private var syphon:         [CameraSlot: SyphonBridge] = [:]
+    // Optional NDI output for consumers that can't speak Syphon. Off by default: unlike
+    // Syphon's zero-copy IOSurface handoff, NDI re-encodes every frame, so it costs real
+    // CPU and latency even when the consumer is on this same machine.
+    private var ndi:            [CameraSlot: NDIBridge]    = [:]
+    // NDI runs on its own queue per slot so it can never hold up Syphon or the preview,
+    // which are the primary path. The semaphore keeps at most one frame in flight: if NDI
+    // is still busy the frame is dropped rather than queued, so a slow encode can't build
+    // an unbounded backlog of stale frames (which would add latency as well as memory).
+    private var ndiQueues:      [CameraSlot: DispatchQueue]     = [:]
+    private var ndiGate:        [CameraSlot: DispatchSemaphore] = [:]
+    private var ndiDropped:     [CameraSlot: Int]               = [:]
+    // The sinks are created/torn down on the main thread but read on the frame thread.
+    private let ndiLock = NSLock()
+    private var ndiItem: NSMenuItem?
+    private var ndiH264Item: NSMenuItem?
+    private var ndiSpeedHQItem: NSMenuItem?
+    private static let kNDIKey = "EpocCamNDIOutput"
+    private static let kNDIH264Key = "EpocCamNDIPassthrough"
+    // Frame size from the decoded stream, needed to describe compressed frames to NDI
+    // (the passthrough path never looks at pixels).
+    private var lastFrameSize: [CameraSlot: (Int, Int)] = [:]
+    private var videoViews:     [CameraSlot: VideoView]    = [:]
+    private var statusLabels:   [CameraSlot: NSTextField]  = [:]
+    private var statusOverlays: [CameraSlot: NSView]       = [:]
+    private var titleLabels:    [CameraSlot: NSTextField]  = [:]
+    private var lightButtons:   [CameraSlot: NSButton]     = [:]
+    private var focusButtons:   [CameraSlot: NSButton]     = [:]
+    private var refocusButtons: [CameraSlot: NSButton]     = [:]
+    // Reported by the phone, never inferred here — the button mirrors the phone.
+    private var focusStates:    [CameraSlot: FocusStatus]  = [:]
+    // Reported by the phone: capability travels with state, so the menu reflects what this
+    // particular camera can actually do rather than assuming.
+    private var stabStates:     [CameraSlot: StabilizationState] = [:]
+    private var stabItems:      [CameraSlot: NSMenuItem]  = [:]
+    private var fpsStates:      [CameraSlot: FpsState]    = [:]
+    private var cameraStates:   [CameraSlot: CameraFacingState] = [:]
+    private var cameraButtons:  [CameraSlot: NSButton]    = [:]
+    // Kept rather than written straight into the label: the title now shows battery and
+    // frame rate together, and each arrives in its own packet, so whichever lands second
+    // would otherwise wipe the other.
+    private var batteryStates:  [CameraSlot: (level: Int, charging: Bool)] = [:]
+    private var fpsMenus:       [CameraSlot: NSMenu]      = [:]
+    // What we last *asked* each phone to do. The phone doesn't acknowledge, so this tracks
+    // the request, not confirmed hardware state.
+    private var torchOn:        [CameraSlot: Bool]         = [:]
+    private var resolutionMenus:[CameraSlot: NSMenu]       = [:]
+    private var alwaysOnTopItem: NSMenuItem?
+    private static let kAlwaysOnTopKey = "EpocCamAlwaysOnTop"
+    private var activeFormatIndex: [CameraSlot: Int] = [:]
+    // Last formats each phone advertised, kept so a swap can repopulate the other slot's
+    // resolution menu without waiting for that phone to announce itself again.
+    private var slotFormats: [CameraSlot: [VideoFormat]] = [:]
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        guard claimSingleInstance() else { return }
+        for slot in CameraSlot.allCases {
+            activeFormatIndex[slot] = UserDefaults.standard.integer(forKey: slot.lastFormatKey)
+        }
+        buildMenu()
+        buildWindow()
+        setAlwaysOnTop(UserDefaults.standard.bool(forKey: Self.kAlwaysOnTopKey))
+        setNDI(UserDefaults.standard.bool(forKey: Self.kNDIKey))
+        startPipeline()
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    // Two viewers on one machine actively break things rather than merely duplicating work:
+    // each streamer serves a single viewer socket, so the second instance fights the first
+    // for the phones, and both would publish Syphon servers *and* NDI sources under the same
+    // names. Hand focus to the instance already running and bow out.
+    private func claimSingleInstance() -> Bool {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return true }
+        let mine = ProcessInfo.processInfo.processIdentifier
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .filter { $0.processIdentifier != mine }
+        guard let existing = others.first else { return true }
+        NSLog("EpocCam: another viewer is already running (pid %d) — activating it and exiting",
+              existing.processIdentifier)
+        existing.activate(options: [.activateIgnoringOtherApps])
+        NSApp.terminate(nil)
+        return false
+    }
+
+    // MARK: - Menu
+
+    private func buildMenu() {
+        let mainMenu = NSMenu()
+
+        // App menu
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "About EpocCam Viewer",
+                        action: #selector(showAbout(_:)),
+                        keyEquivalent: "")
+        appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(withTitle: "Quit EpocCam Viewer",
+                        action: #selector(NSApplication.terminate(_:)),
+                        keyEquivalent: "q")
+        appMenuItem.submenu = appMenu
+
+        // One menu per camera slot. Every control that affects a single phone lives under
+        // that phone's own menu, rather than making the operator find the same camera again
+        // in a separate Resolution menu, Frame rate menu and Cameras menu.
+        for slot in CameraSlot.allCases {
+            let camItem = NSMenuItem()
+            camItem.title = "Camera \(slot.label)"
+            mainMenu.addItem(camItem)
+            let menu = NSMenu(title: "Camera \(slot.label)")
+            menu.autoenablesItems = false
+
+            let resItem = NSMenuItem(title: "Resolution", action: nil, keyEquivalent: "")
+            let resMenu = NSMenu(title: "Resolution")
+            let placeholder = NSMenuItem(title: "Connecting…", action: nil, keyEquivalent: "")
+            placeholder.isEnabled = false
+            resMenu.addItem(placeholder)
+            resItem.submenu = resMenu
+            menu.addItem(resItem)
+            resolutionMenus[slot] = resMenu
+
+            // 60fps trades per-frame quality (the same CBR bitrate spread over twice the
+            // frames) for roughly one 30fps frame interval of latency — an operator choice
+            // per camera, not a global default.
+            let fpsItem = NSMenuItem(title: "Frame rate", action: nil, keyEquivalent: "")
+            let fpsMenu = NSMenu(title: "Frame rate")
+            fpsMenu.autoenablesItems = false
+            for rate in [30, 60] {
+                let item = NSMenuItem(title: "\(rate) fps",
+                                      action: #selector(frameRateSelected(_:)), keyEquivalent: "")
+                item.tag = rate
+                item.representedObject = slot.rawValue
+                fpsMenu.addItem(item)
+            }
+            fpsItem.submenu = fpsMenu
+            menu.addItem(fpsItem)
+            fpsMenus[slot] = fpsMenu
+
+            menu.addItem(NSMenuItem.separator())
+            let stab = NSMenuItem(title: "Digital stabilization (crops the image)",
+                                  action: #selector(toggleStabilization(_:)), keyEquivalent: "")
+            stab.tag = slot.rawValue
+            stab.isEnabled = false      // until a phone reports it can do this
+            menu.addItem(stab)
+            stabItems[slot] = stab
+
+            camItem.submenu = menu
+            applyFrameRateMenu(slot)
+            applyStabilizationMenu(slot)
+        }
+
+        // Cameras menu — the one camera action that isn't per-slot.
+        let camMenuItem = NSMenuItem()
+        camMenuItem.title = "Cameras"
+        mainMenu.addItem(camMenuItem)
+        let camMenu = NSMenu(title: "Cameras")
+        camMenu.addItem(withTitle: "Swap A ↔ B",
+                        action: #selector(swapCameras(_:)),
+                        keyEquivalent: "s")
+        camMenuItem.submenu = camMenu
+
+        // Window menu — keep the viewer above Millumin while operating it.
+        let winMenuItem = NSMenuItem()
+        winMenuItem.title = "Window"
+        mainMenu.addItem(winMenuItem)
+        let winMenu = NSMenu(title: "Window")
+        let onTop = NSMenuItem(title: "Always on Top",
+                               action: #selector(toggleAlwaysOnTop(_:)),
+                               keyEquivalent: "t")
+        winMenu.addItem(onTop)
+        winMenuItem.submenu = winMenu
+        alwaysOnTopItem = onTop
+
+        // Output menu — NDI is a test/opt-in path alongside Syphon, never a replacement.
+        let outMenuItem = NSMenuItem()
+        outMenuItem.title = "Output"
+        mainMenu.addItem(outMenuItem)
+        let outMenu = NSMenu(title: "Output")
+        // Items are enabled/disabled explicitly: the encoding choices only mean anything
+        // while NDI output is actually on.
+        outMenu.autoenablesItems = false
+        let ndiToggle = NSMenuItem(title: "NDI Output",
+                                   action: #selector(toggleNDI(_:)),
+                                   keyEquivalent: "n")
+        outMenu.addItem(ndiToggle)
+        if NDIBridge.supportsCompressed() {
+            outMenu.addItem(NSMenuItem.separator())
+            let hdr = NSMenuItem(title: "NDI encoding", action: nil, keyEquivalent: "")
+            hdr.isEnabled = false
+            outMenu.addItem(hdr)
+            // Mutually exclusive: these are two ways of sending, not two outputs.
+            let shq = NSMenuItem(title: "    Re-encode as SpeedHQ",
+                                 action: #selector(selectNDISpeedHQ(_:)), keyEquivalent: "")
+            let h264 = NSMenuItem(title: "    Pass through H.264 (no re-encode)",
+                                  action: #selector(selectNDIPassthrough(_:)), keyEquivalent: "")
+            outMenu.addItem(shq)
+            outMenu.addItem(h264)
+            ndiSpeedHQItem = shq
+            ndiH264Item = h264
+            let warn = NSMenuItem(title: "    ⚠︎ passthrough uses the Advanced SDK trial: stops after 30 min",
+                                  action: nil, keyEquivalent: "")
+            warn.isEnabled = false
+            outMenu.addItem(warn)
+        }
+        outMenu.addItem(NSMenuItem.separator())
+        let note = NSMenuItem(title: "Syphon is always on (\"EpocCam A\" / \"EpocCam B\")",
+                              action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        outMenu.addItem(note)
+        outMenuItem.submenu = outMenu
+        ndiItem = ndiToggle
+
+        NSApp.mainMenu = mainMenu
+    }
+
+    @objc private func showAbout(_ sender: Any?) {
+        let credits = NSAttributedString(string:
+            "Dual-camera EpocCam receiver — discovers phones over mDNS and publishes\n" +
+            "each as a Syphon source (\"EpocCam A\" / \"EpocCam B\") for Millumin and others.\n\n" +
+            "github.com/stanelie/EpocCam-receiver")
+        NSApp.orderFrontStandardAboutPanel(options: [.credits: credits])
+    }
+
+    @objc private func toggleNDI(_ sender: Any?) {
+        setNDI(!UserDefaults.standard.bool(forKey: Self.kNDIKey))
+    }
+
+    private func setNDI(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: Self.kNDIKey)
+        if on {
+            for slot in CameraSlot.allCases where ndiSink(slot) == nil {
+                guard let b = NDIBridge(name: slot.syphonName) else {
+                    NSLog("EpocCam[%@]: NDI sender could not be created", slot.label)
+                    continue
+                }
+                ndiQueues[slot] = DispatchQueue(label: "epoccam.ndi.\(slot.label)", qos: .userInitiated)
+                ndiGate[slot]   = DispatchSemaphore(value: 1)
+                ndiDropped[slot] = 0
+                if let fps = fpsStates[slot]?.current { b.setDeclaredFrameRate(Int32(fps)) }
+                ndiLock.lock(); ndi[slot] = b; ndiLock.unlock()
+            }
+        } else {
+            tearDownNDI(completion: nil)
+        }
+        NSLog("EpocCam: NDI output %@", on ? "ON" : "OFF")
+        syncOutputMenu()
+    }
+
+    // Destroys the senders and reports back only once they are really gone. Teardown runs on
+    // each slot's own queue so a sender can't be destroyed mid-send, which means it completes
+    // *after* this returns — so anything that recreates a sender with the same name has to
+    // wait for the completion rather than run straight away.
+    private func tearDownNDI(completion: (() -> Void)?) {
+        ndiLock.lock()
+        let sinks = ndi
+        ndi.removeAll()
+        ndiLock.unlock()
+        let queues = ndiQueues
+        ndiQueues.removeAll(); ndiGate.removeAll(); ndiDropped.removeAll()
+
+        let group = DispatchGroup()
+        for (slot, sink) in sinks {
+            let q = queues[slot] ?? DispatchQueue.global()
+            group.enter()
+            q.async { sink.stop(); group.leave() }
+        }
+        guard let completion else { return }
+        group.notify(queue: .main) {
+            // Small settle before reusing the same source names, so NDI has actually
+            // released them and a receiver sees a clean drop-and-return rather than a
+            // duplicate name.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: completion)
+        }
+    }
+
+    private func ndiSink(_ slot: CameraSlot) -> NDIBridge? {
+        ndiLock.lock(); defer { ndiLock.unlock() }
+        return ndi[slot]
+    }
+
+    // Hand the frame to NDI without ever blocking the caller. Returns immediately if the
+    // previous frame is still encoding — dropping the older frame is both cheaper and
+    // *lower* latency than working through a backlog.
+    private func publishNDI(_ slot: CameraSlot, _ pixelBuffer: CVPixelBuffer) {
+        guard let sink = ndiSink(slot),
+              let queue = ndiQueues[slot],
+              let gate = ndiGate[slot] else { return }
+        guard gate.wait(timeout: .now()) == .success else {
+            let n = (ndiDropped[slot] ?? 0) + 1
+            ndiDropped[slot] = n
+            if n % 30 == 0 { NSLog("EpocCam[%@]: NDI behind — %d frames dropped", slot.label, n) }
+            return
+        }
+        queue.async {
+            sink.send(pixelBuffer)
+            gate.signal()
+        }
+    }
+
+    @objc private func selectNDISpeedHQ(_ sender: Any?)    { setNDIPassthrough(false) }
+    @objc private func selectNDIPassthrough(_ sender: Any?) { setNDIPassthrough(true) }
+
+    private func setNDIPassthrough(_ on: Bool) {
+        let changed = UserDefaults.standard.bool(forKey: Self.kNDIH264Key) != on
+        UserDefaults.standard.set(on, forKey: Self.kNDIH264Key)
+        syncOutputMenu()
+        NSLog("EpocCam: NDI encoding = %@", on ? "H.264 passthrough" : "SpeedHQ")
+
+        // Recycle the senders on a real change. This switches the frame format
+        // (BGRA <-> H.264) and a receiver that already negotiated the old one does not
+        // renegotiate on a live sender — it just sits on the last frame it understood.
+        // Dropping and recreating the source makes the receiver reconnect and pick up
+        // the new format.
+        if changed, UserDefaults.standard.bool(forKey: Self.kNDIKey) {
+            NSLog("EpocCam: recycling NDI senders for the format change")
+            tearDownNDI { [weak self] in
+                guard let self, UserDefaults.standard.bool(forKey: Self.kNDIKey) else { return }
+                self.setNDI(true)
+                NSLog("EpocCam: NDI senders back up in %@ mode",
+                      self.ndiPassthrough ? "H.264 passthrough" : "SpeedHQ")
+            }
+        }
+    }
+
+    private func syncOutputMenu() {
+        let ndiOn = UserDefaults.standard.bool(forKey: Self.kNDIKey)
+        let pass  = ndiPassthrough
+        ndiItem?.state        = ndiOn ? .on : .off
+        ndiSpeedHQItem?.state = pass ? .off : .on
+        ndiH264Item?.state    = pass ? .on : .off
+        // Deliberately still selectable while NDI output is off, so the mode can be chosen
+        // first and the master toggle then brings NDI up already in that mode.
+        ndiSpeedHQItem?.isEnabled = true
+        ndiH264Item?.isEnabled    = true
+        _ = ndiOn
+    }
+
+    // Gated on the build actually supporting it: the preference persists across builds, so a
+    // base-SDK build must not honour a passthrough flag left set by an Advanced build — it
+    // would skip the uncompressed send while sendCompressed does nothing, and NDI would go
+    // silently dead.
+    private var ndiPassthrough: Bool {
+        NDIBridge.supportsCompressed() && UserDefaults.standard.bool(forKey: Self.kNDIH264Key)
+    }
+
+    @objc private func toggleAlwaysOnTop(_ sender: Any?) {
+        setAlwaysOnTop(!UserDefaults.standard.bool(forKey: Self.kAlwaysOnTopKey))
+    }
+
+    // Persisted: an operator who wants the viewer pinned over Millumin wants it pinned
+    // again next launch, not to rediscover the menu item every show.
+    private func setAlwaysOnTop(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: Self.kAlwaysOnTopKey)
+        window?.level = on ? .floating : .normal
+        alwaysOnTopItem?.state = on ? .on : .off
+        NSLog("EpocCam: always on top %@", on ? "ON" : "OFF")
+    }
+
+    // Overlay buttons are AppKit views layered over VideoView — like the LED button, they
+    // never touch the CVPixelBuffer, so they stay out of the Syphon output.
+    private func makeOverlayButton(title: String, action: Selector, slot: CameraSlot) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.tag = slot.rawValue
+        b.isBordered = false
+        b.wantsLayer = true
+        b.layer?.cornerRadius = 6
+        b.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.45).cgColor
+        b.translatesAutoresizingMaskIntoConstraints = false
+        setOverlayTitle(b, title)
+        return b
+    }
+
+    // NSButton won't render an embedded newline via `title`; an attributed title with a
+    // centred paragraph style is what actually gives two centred lines.
+    private func setOverlayTitle(_ b: NSButton, _ title: String) {
+        let para = NSMutableParagraphStyle()
+        para.alignment = .center
+        b.attributedTitle = NSAttributedString(string: title, attributes: [
+            .foregroundColor: NSColor.white,
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .paragraphStyle: para,
+        ])
+    }
+
+    @objc private func toggleFocusMode(_ sender: NSButton) {
+        guard let slot = CameraSlot(rawValue: sender.tag) else { return }
+        // Don't ask a camera that cannot focus, or one that hasn't reported yet. The button
+        // is dimmed and inert in both cases, so this only catches a press that raced the
+        // state packet.
+        guard let st = focusStates[slot], st.afSupported else { return }
+        let goingManual = !st.state.isManual
+        browser.sendFocusCommand(slot: slot, goingManual ? .manual : .auto)
+        NSLog("EpocCam[%@]: focus %@ requested", slot.label, goingManual ? "MANUAL" : "AUTO")
+        // Deliberately no optimistic update: the phone reports the real state back, and
+        // showing a state it might not reach would be worse than a moment of lag.
+    }
+
+    @objc private func triggerRefocus(_ sender: NSButton) {
+        guard let slot = CameraSlot(rawValue: sender.tag) else { return }
+        guard focusStates[slot]?.afSupported == true else { return }
+        browser.sendFocusCommand(slot: slot, .refocus)
+        NSLog("EpocCam[%@]: refocus requested", slot.label)
+    }
+
+    private func applyFocusAppearance(_ slot: CameraSlot) {
+        // An absent entry means no phone has reported yet, which is not the same as a phone
+        // reporting that it cannot focus: the first shows the neutral label dimmed (as the
+        // camera button does before a phone says which cameras it has), the second says
+        // "fixed focus" outright.
+        let st = focusStates[slot]
+        let canFocus = st?.afSupported ?? false
+        if let b = focusButtons[slot] {
+            setOverlayTitle(b, st?.label ?? FocusState.auto.label)
+            // A fixed-focus camera gets a dimmed, inert button rather than one that looks
+            // live and does nothing — same treatment as a phone with only one camera. The
+            // capability is per-camera, so switching to the front camera can dim this
+            // button and switching back can restore it.
+            b.isEnabled = canFocus
+            b.alphaValue = canFocus ? 1.0 : 0.4
+        }
+        refocusButtons[slot]?.isHidden = !canFocus || !(st?.state.isManual ?? false)
+    }
+
+    @objc private func toggleLight(_ sender: NSButton) {
+        guard let slot = CameraSlot(rawValue: sender.tag) else { return }
+        let on = !(torchOn[slot] ?? false)
+        torchOn[slot] = on
+        applyLightAppearance(slot)
+        browser.setTorch(slot: slot, on: on)
+        NSLog("EpocCam[%@]: torch %@ requested", slot.label, on ? "ON" : "OFF")
+    }
+
+    private func applyLightAppearance(_ slot: CameraSlot) {
+        guard let b = lightButtons[slot] else { return }
+        let on = torchOn[slot] ?? false
+        b.layer?.backgroundColor = on ? NSColor.systemYellow.withAlphaComponent(0.85).cgColor
+                                      : NSColor.black.withAlphaComponent(0.45).cgColor
+        b.alphaValue = on ? 1.0 : 0.65
+    }
+
+    @objc private func toggleStabilization(_ sender: NSMenuItem) {
+        guard let slot = CameraSlot(rawValue: sender.tag) else { return }
+        let st = stabStates[slot] ?? StabilizationState()
+        guard st.eisSupported else { return }
+        let want = !st.eisOn
+        UserDefaults.standard.set(want, forKey: slot.stabilizationKey)   // survives restarts
+        browser.setStabilization(slot: slot, on: want)
+        NSLog("EpocCam[%@]: digital stabilization %@ requested", slot.label, want ? "ON" : "OFF")
+        // No optimistic update — the phone reports back what it actually applied.
+    }
+
+    private func applyStabilizationMenu(_ slot: CameraSlot) {
+        guard let item = stabItems[slot] else { return }
+        let st = stabStates[slot] ?? StabilizationState()
+        item.isEnabled = st.eisSupported
+        item.state = st.eisOn ? .on : .off
+        // Say why it's unavailable rather than leaving a dead greyed row.
+        item.title = "Digital stabilization (crops the image)"
+                     + (st.eisSupported ? "" : " — not supported")
+    }
+
+    // "Camera A — ⚡85% · 60fps", with each part appearing only once that phone has
+    // reported it, so a slot that is still connecting doesn't show invented values.
+    private func applyTitle(_ slot: CameraSlot) {
+        var parts: [String] = []
+        if let b = batteryStates[slot] {
+            parts.append("\(b.charging ? "⚡" : "")\(b.level)%")
+        }
+        if let f = fpsStates[slot] {
+            parts.append("\(f.current)fps")
+        }
+        let suffix = parts.isEmpty ? "" : " — " + parts.joined(separator: " · ")
+        titleLabels[slot]?.stringValue = "Camera \(slot.label)\(suffix)"
+    }
+
+    @objc private func frameRateSelected(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? Int,
+              let slot = CameraSlot(rawValue: raw) else { return }
+        let rate = sender.tag
+        // Refuse a rate this phone reported it can't sustain, rather than sending a request
+        // that comes back clamped and leaves the menu disagreeing with the stream.
+        if rate >= 60, let st = fpsStates[slot], !st.supports60 { return }
+        browser.setFps(slot: slot, fps: rate)
+        NSLog("EpocCam[%@]: user selected %d fps", slot.label, rate)
+        // Optimistic check so the click registers immediately; the phone's fpsState packet
+        // corrects it if the encoder settled somewhere else.
+        applyFrameRateMenu(slot, pending: rate)
+    }
+
+    // `pending` shows a just-clicked rate before the phone has confirmed it.
+    private func applyFrameRateMenu(_ slot: CameraSlot, pending: Int? = nil) {
+        guard let menu = fpsMenus[slot] else { return }
+        let st = fpsStates[slot]
+        let saved = UserDefaults.standard.integer(forKey: slot.frameRateKey)
+        let current = pending ?? st?.current ?? (saved > 0 ? saved : 30)
+        // Until a phone reports in, leave 60 selectable: the remembered choice has to be
+        // clickable while the camera is still connecting, same as the resolution menu.
+        let allow60 = st?.supports60 ?? true
+        for item in menu.items {
+            item.state = item.tag == current ? .on : .off
+            item.isEnabled = item.tag < 60 || allow60
+            item.title = item.tag >= 60 && !allow60 ? "60 fps — not supported" : "\(item.tag) fps"
+        }
+    }
+
+    // Bright red while this app is frontmost, normal otherwise. Keyed to application
+    // activation rather than window key state: the question being answered is "are my
+    // keystrokes going to this app instead of Millumin", which is an app-level fact.
+    private static let focusRed = NSColor(srgbRed: 0.95, green: 0.05, blue: 0.05, alpha: 1.0)
+
+    private func applyFocusHighlight() {
+        guard let window else { return }
+        let active = NSApp.isActive
+        window.backgroundColor = active ? Self.focusRed : .windowBackgroundColor
+        NSLog("EpocCam: window focus %@ — titlebar %@",
+              active ? "GAINED" : "lost", active ? "RED" : "normal")
+    }
+
+    @objc private func toggleCameraFacing(_ sender: NSButton) {
+        guard let slot = CameraSlot(rawValue: sender.tag) else { return }
+        let st = cameraStates[slot] ?? CameraFacingState()
+        let want = !st.front
+        // Don't offer a camera this phone doesn't have.
+        if want && !st.frontAvailable { return }
+        if !want && !st.backAvailable { return }
+        browser.setCameraFacing(slot: slot, front: want)
+        NSLog("EpocCam[%@]: %@ camera requested", slot.label, want ? "front" : "back")
+        // No optimistic update — the phone reports back which camera it actually opened.
+    }
+
+    private func applyCameraAppearance(_ slot: CameraSlot) {
+        guard let b = cameraButtons[slot] else { return }
+        let st = cameraStates[slot] ?? CameraFacingState()
+        setOverlayTitle(b, st.front ? "front\ncamera" : "back\ncamera")
+        // A phone with only one camera gets a dimmed, inert button rather than one that
+        // looks live and does nothing.
+        let canSwitch = st.frontAvailable && st.backAvailable
+        b.isEnabled = canSwitch
+        b.alphaValue = canSwitch ? 1.0 : 0.4
+    }
+
+    @objc private func swapCameras(_ sender: Any?) {
+        browser.swapSlots()
+    }
+
+    // Swapping moves each phone to the other pane, so everything the operator sees for that
+    // camera has to travel with it. Without this the titles, menu checkmarks and overlay
+    // buttons keep describing the phone that *used* to be in the slot, and stay wrong until
+    // a packet happens to correct them — up to a minute for battery, and not at all for
+    // stabilization or frame rate, which are only sent on connect or on change.
+    private func handleSwap() {
+        let a = CameraSlot.a, b = CameraSlot.b
+        func exchange<T>(_ d: inout [CameraSlot: T]) { let t = d[a]; d[a] = d[b]; d[b] = t }
+        exchange(&focusStates)
+        exchange(&stabStates)
+        exchange(&fpsStates)
+        exchange(&cameraStates)
+        exchange(&batteryStates)
+        exchange(&torchOn)
+        exchange(&activeFormatIndex)
+        exchange(&slotFormats)
+        exchange(&lastFrameSize)
+
+        // The persisted settings follow the phone as well, so when it reconnects it is given
+        // the configuration it actually had rather than the other camera's.
+        let d = UserDefaults.standard
+        for (ka, kb) in [(a.lastFormatKey, b.lastFormatKey),
+                         (a.stabilizationKey, b.stabilizationKey),
+                         (a.frameRateKey, b.frameRateKey),
+                         (a.cameraFacingKey, b.cameraFacingKey)] {
+            let va = d.object(forKey: ka), vb = d.object(forKey: kb)
+            if let vb { d.set(vb, forKey: ka) } else { d.removeObject(forKey: ka) }
+            if let va { d.set(va, forKey: kb) } else { d.removeObject(forKey: kb) }
+        }
+
+        for slot in CameraSlot.allCases {
+            applyTitle(slot)
+            applyFrameRateMenu(slot)
+            applyStabilizationMenu(slot)
+            applyFocusAppearance(slot)
+            applyCameraAppearance(slot)
+            applyLightAppearance(slot)
+            populateResolutionMenu(slot: slot, formats: slotFormats[slot] ?? [])
+            // NDI declares a frame rate per sender, and the senders stay with the slot.
+            ndiLock.lock(); let sink = ndi[slot]; ndiLock.unlock()
+            if let fps = fpsStates[slot]?.current { sink?.setDeclaredFrameRate(Int32(fps)) }
+        }
+        NSLog("EpocCam: swapped per-camera state and settings to follow the cameras")
+    }
+
+    // Called on the main thread when a slot's sender advertises its available formats.
+    private func populateResolutionMenu(slot: CameraSlot, formats: [VideoFormat]) {
+        guard let menu = resolutionMenus[slot] else { return }
+        let active = activeFormatIndex[slot] ?? 0
+        menu.removeAllItems()
+        guard !formats.isEmpty else {
+            let placeholder = NSMenuItem(title: "Connecting…", action: nil, keyEquivalent: "")
+            placeholder.isEnabled = false
+            menu.addItem(placeholder)
+            return
+        }
+        for fmt in formats {
+            let item = NSMenuItem(title: fmt.label,
+                                  action: #selector(resolutionSelected(_:)),
+                                  keyEquivalent: "")
+            item.tag = fmt.index
+            item.representedObject = slot.rawValue
+            item.state = fmt.index == active ? .on : .off
+            menu.addItem(item)
+        }
+    }
+
+    @objc private func resolutionSelected(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? Int,
+              let slot = CameraSlot(rawValue: raw) else { return }
+        let idx = sender.tag
+        guard activeFormatIndex[slot] != idx else { return }
+        activeFormatIndex[slot] = idx
+        resolutionMenus[slot]?.items.forEach { $0.state = $0.tag == idx ? .on : .off }
+        browser.selectFormat(slot: slot, index: idx)
+        NSLog("EpocCam[%@]: user selected format index %d", slot.label, idx)
+    }
+
+    // MARK: - Window
+
+    private func buildWindow() {
+        let rect = NSRect(x: 0, y: 0, width: 1280, height: 400)
+        window = NSWindow(contentRect: rect,
+                          styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                          backing: .buffered, defer: false)
+        window.title = "EpocCam Viewer"
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+
+        let content = window.contentView!
+        // Focus alarm: the titlebar goes bright red whenever this app is frontmost, so it is
+        // obvious at a glance during a show that keystrokes are going here and not to
+        // Millumin. A transparent titlebar draws the window's background colour, which is how
+        // the red gets there — but the content view does not cover every pixel below it (the
+        // 30pt title row and the 2pt seam between panes both show window background), so give
+        // the content its own opaque layer or the red bleeds into the status row and straight
+        // down between the two video panes.
+        content.wantsLayer = true
+        content.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        window.titlebarAppearsTransparent = true
+        for name in [NSApplication.didBecomeActiveNotification,
+                     NSApplication.didResignActiveNotification] {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) {
+                [weak self] _ in self?.applyFocusHighlight()
+            }
+        }
+        applyFocusHighlight()
+
+        // Title row above the panes: one label per slot ("Camera A — 82%"), same column
+        // widths as the video stack below so each title sits above its own pane.
+        let titleRow = NSStackView()
+        titleRow.orientation = .horizontal
+        titleRow.distribution = .fillEqually
+        titleRow.spacing = 2
+        titleRow.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(titleRow)
+
+        // Side-by-side panes: Camera A on the left, Camera B on the right.
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.distribution = .fillEqually
+        stack.spacing = 2
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(stack)
+        NSLayoutConstraint.activate([
+            titleRow.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            titleRow.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            titleRow.topAnchor.constraint(equalTo: content.topAnchor),
+            titleRow.heightAnchor.constraint(equalToConstant: 30),
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: titleRow.bottomAnchor),
+            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+        ])
+
+        for slot in CameraSlot.allCases {
+            titleRow.addArrangedSubview(makeTitleLabel(slot: slot))
+            stack.addArrangedSubview(makePane(slot: slot))
+        }
+
+        // Swap button sits across the two title cells rather than inside either one — it acts
+        // on both. Added to `content` (not titleRow) so it can straddle the pane boundary; the
+        // per-slot labels are centred within their own halves, so they don't collide with it.
+        let swap = NSButton(title: "Swap A ↔ B", target: self, action: #selector(swapCameras(_:)))
+        // Borderless over its own layer rather than a stock bezel: .rounded has a fixed
+        // intrinsic height and simply ignores a height constraint, so it can't be made to
+        // match the title bar.
+        swap.isBordered = false
+        swap.wantsLayer = true
+        swap.layer?.backgroundColor = NSColor.systemOrange.cgColor
+        swap.contentTintColor = .white
+        swap.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        swap.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(swap)
+        NSLayoutConstraint.activate([
+            swap.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            swap.centerYAnchor.constraint(equalTo: titleRow.centerYAnchor),
+            swap.heightAnchor.constraint(equalTo: titleRow.heightAnchor),
+            swap.widthAnchor.constraint(equalToConstant: 110),
+        ])
+    }
+
+    private func makeTitleLabel(slot: CameraSlot) -> NSView {
+        let container = NSView()
+        container.wantsLayer = true
+        container.layer?.backgroundColor = NSColor.black.cgColor
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        let label = NSTextField(labelWithString: "Camera \(slot.label)")
+        label.textColor = .white
+        label.alignment = .center
+        label.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+        ])
+
+        titleLabels[slot] = label
+        return container
+    }
+
+    // One pane = a VideoView plus a status pill shown until frames arrive.
+    private func makePane(slot: CameraSlot) -> NSView {
+        let pane = NSView()
+        pane.wantsLayer = true
+        pane.layer?.backgroundColor = NSColor.black.cgColor
+        pane.translatesAutoresizingMaskIntoConstraints = false
+
+        let videoView = VideoView(frame: .zero)
+        videoView.label = slot.label
+        videoView.translatesAutoresizingMaskIntoConstraints = false
+        pane.addSubview(videoView)
+        NSLayoutConstraint.activate([
+            videoView.leadingAnchor.constraint(equalTo: pane.leadingAnchor),
+            videoView.trailingAnchor.constraint(equalTo: pane.trailingAnchor),
+            videoView.topAnchor.constraint(equalTo: pane.topAnchor),
+            videoView.bottomAnchor.constraint(equalTo: pane.bottomAnchor),
+        ])
+
+        let pill = NSView()
+        pill.wantsLayer = true
+        pill.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.55).cgColor
+        pill.layer?.cornerRadius = 10
+        pill.translatesAutoresizingMaskIntoConstraints = false
+        pane.addSubview(pill)
+
+        let label = NSTextField(labelWithString: "Searching for camera \(slot.label)…")
+        label.textColor = .white
+        label.alignment = .center
+        label.font = NSFont.systemFont(ofSize: 14, weight: .medium)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        pill.addSubview(label)
+
+        NSLayoutConstraint.activate([
+            pill.centerXAnchor.constraint(equalTo: pane.centerXAnchor),
+            pill.centerYAnchor.constraint(equalTo: pane.centerYAnchor),
+            label.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 16),
+            label.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -16),
+            label.topAnchor.constraint(equalTo: pill.topAnchor, constant: 10),
+            label.bottomAnchor.constraint(equalTo: pill.bottomAnchor, constant: -10),
+        ])
+
+        // Camera LED toggle. Deliberately an AppKit view layered over the VideoView, never
+        // composited into the CVPixelBuffer — Syphon publishes that buffer straight from the
+        // decoder, so overlays are excluded from the Syphon output by construction.
+        // Top-right of each pane.
+        let light = NSButton(title: "💡", target: self, action: #selector(toggleLight(_:)))
+        light.tag = slot.rawValue
+        light.isBordered = false
+        light.font = NSFont.systemFont(ofSize: 20)
+        light.wantsLayer = true
+        light.layer?.cornerRadius = 6
+        light.translatesAutoresizingMaskIntoConstraints = false
+        pane.addSubview(light)
+        NSLayoutConstraint.activate([
+            light.topAnchor.constraint(equalTo: pane.topAnchor, constant: 8),
+            light.widthAnchor.constraint(equalToConstant: 36),
+            light.heightAnchor.constraint(equalToConstant: 30),
+            light.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -8),
+        ])
+
+        // Focus controls, upper-left. Same wording as the phone's own button; the label is
+        // driven entirely by what the phone reports, so the two always agree.
+        let focus = makeOverlayButton(title: FocusState.auto.label,
+                                      action: #selector(toggleFocusMode(_:)), slot: slot)
+        pane.addSubview(focus)
+        // "Focus now" sits directly under it, and only exists in manual mode — in auto there
+        // is nothing to trigger.
+        let refocus = makeOverlayButton(title: "focus\nnow",
+                                        action: #selector(triggerRefocus(_:)), slot: slot)
+        refocus.isHidden = true
+        pane.addSubview(refocus)
+        NSLayoutConstraint.activate([
+            focus.topAnchor.constraint(equalTo: pane.topAnchor, constant: 8),
+            focus.leadingAnchor.constraint(equalTo: pane.leadingAnchor, constant: 8),
+            focus.widthAnchor.constraint(equalToConstant: 76),
+            focus.heightAnchor.constraint(equalToConstant: 38),
+            refocus.topAnchor.constraint(equalTo: focus.bottomAnchor, constant: 6),
+            refocus.leadingAnchor.constraint(equalTo: focus.leadingAnchor),
+            refocus.widthAnchor.constraint(equalTo: focus.widthAnchor),
+            refocus.heightAnchor.constraint(equalToConstant: 38),
+        ])
+
+        // Front/back camera, under the light button. Like the focus control, its label is
+        // driven by what the phone reports rather than by what was requested, so the two
+        // always agree — including when a phone without a front camera falls back.
+        let cam = makeOverlayButton(title: "back\ncamera",
+                                    action: #selector(toggleCameraFacing(_:)), slot: slot)
+        pane.addSubview(cam)
+        NSLayoutConstraint.activate([
+            cam.topAnchor.constraint(equalTo: light.bottomAnchor, constant: 6),
+            cam.trailingAnchor.constraint(equalTo: pane.trailingAnchor, constant: -8),
+            cam.widthAnchor.constraint(equalToConstant: 76),
+            cam.heightAnchor.constraint(equalToConstant: 38),
+        ])
+
+        videoViews[slot]     = videoView
+        statusLabels[slot]   = label
+        statusOverlays[slot] = pill
+        lightButtons[slot]   = light
+        focusButtons[slot]   = focus
+        refocusButtons[slot] = refocus
+        cameraButtons[slot]  = cam
+        applyCameraAppearance(slot)
+        focusStates[slot]    = nil   // nothing reported yet — the button stays inert
+        applyFocusAppearance(slot)
+        torchOn[slot]        = false
+        applyLightAppearance(slot)
+        return pane
+    }
+
+    // MARK: - Frame-rate meter (per slot)
+
+    private final class FPSMeter {
+        var windowStart: CFAbsoluteTime = 0
+        var count = 0
+    }
+    private var meters: [CameraSlot: FPSMeter] = [:]
+
+    private func recordFrame(_ slot: CameraSlot) {
+        let m = meters[slot] ?? { let m = FPSMeter(); meters[slot] = m; return m }()
+        let now = CFAbsoluteTimeGetCurrent()
+        if m.windowStart == 0 { m.windowStart = now }
+        m.count += 1
+        let elapsed = now - m.windowStart
+        if elapsed >= 5.0 {
+            NSLog("EpocCam[%@] FPS: %.1f (%d frames in %.1fs)",
+                  slot.label, Double(m.count) / elapsed, m.count, elapsed)
+            m.windowStart = now
+            m.count = 0
+        }
+    }
+
+    // MARK: - Pipeline
+
+    private func startPipeline() {
+        for slot in CameraSlot.allCases {
+            syphon[slot] = SyphonBridge(serverName: slot.syphonName)
+        }
+
+        browser = EpocCamBrowser()
+        browser.onFormats = { [weak self] slot, formats in
+            DispatchQueue.main.async {
+                self?.slotFormats[slot] = formats
+                self?.populateResolutionMenu(slot: slot, formats: formats)
+            }
+        }
+        browser.onSwap = { [weak self] in self?.handleSwap() }
+        browser.onStatus = { [weak self] slot, msg in
+            // Already dispatched to the main thread by Browser.
+            guard let self else { return }
+            self.statusLabels[slot]?.stringValue = msg
+            self.statusOverlays[slot]?.isHidden = false
+            // When a slot loses its feed, wipe the frozen last frame behind the overlay, and
+            // drop the stale battery reading — it's a different phone by the time one reconnects.
+            if msg.contains("Searching") || msg.contains("lost") {
+                self.videoViews[slot]?.clear()
+                self.batteryStates[slot] = nil
+                self.titleLabels[slot]?.stringValue = "Camera \(slot.label)"
+                self.torchOn[slot] = false
+                self.applyLightAppearance(slot)
+                // Forget the departed phone's focus capability along with its state: the
+                // next phone in this slot may be fixed-focus, and a stale "supported" would
+                // offer a dead button.
+                self.focusStates[slot] = nil
+                self.applyFocusAppearance(slot)
+                self.stabStates[slot] = StabilizationState()
+                self.applyStabilizationMenu(slot)
+                // Forget the departed phone's capability — the next one in this slot may
+                // not be able to do 60, and a stale "supported" would offer a dead option.
+                self.fpsStates[slot] = nil
+                self.applyFrameRateMenu(slot)
+                self.cameraStates[slot] = nil
+                self.applyCameraAppearance(slot)
+                self.applyTitle(slot)
+            }
+        }
+        // Only wire the compressed tap in builds that can use it. Connection.swift skips the
+        // per-frame Annex-B scan entirely when this is nil, so a base-SDK build does no work
+        // for a path it cannot take.
+        if NDIBridge.supportsCompressed() {
+        browser.onCompressedVideo = { [weak self] slot, frame, isKey, sets in
+            guard let self, self.ndiPassthrough else { return }
+            guard let (w, h) = self.lastFrameSize[slot] else { return }   // wait for one decoded frame
+            guard let sink = self.ndiSink(slot),
+                  let queue = self.ndiQueues[slot],
+                  let gate = self.ndiGate[slot] else { return }
+            guard gate.wait(timeout: .now()) == .success else { return }  // drop, never queue
+            queue.async {
+                _ = sink.sendCompressed(frame, extra: sets ?? Data(),
+                                        keyframe: isKey, width: Int32(w), height: Int32(h))
+                gate.signal()
+            }
+        }
+        }
+        browser.onStabilization = { [weak self] slot, st in
+            guard let self else { return }
+            self.stabStates[slot] = st
+            self.applyStabilizationMenu(slot)
+            NSLog("EpocCam[%@]: OIS %@, EIS %@", slot.label,
+                  st.oisSupported ? (st.oisOn ? "on" : "available") : "unavailable",
+                  st.eisSupported ? (st.eisOn ? "on" : "off") : "unavailable")
+        }
+        browser.onCameraFacing = { [weak self] slot, st in
+            guard let self else { return }
+            self.cameraStates[slot] = st
+            // Converge the stored setting on the camera the phone actually opened, so a
+            // fallback isn't re-requested on every reconnect.
+            UserDefaults.standard.set(st.front, forKey: slot.cameraFacingKey)
+            self.applyCameraAppearance(slot)
+            NSLog("EpocCam[%@]: %@ camera (front available: %@)",
+                  slot.label, st.front ? "front" : "back", st.frontAvailable ? "yes" : "no")
+        }
+        browser.onFps = { [weak self] slot, st in
+            guard let self else { return }
+            self.fpsStates[slot] = st
+            // Converge the stored setting on what the phone actually runs at. Without this a
+            // pref holding a rate this phone can't reach (set before its capability was known)
+            // would be re-sent on every connect and rebuild its encoder every time.
+            UserDefaults.standard.set(st.current, forKey: slot.frameRateKey)
+            self.applyFrameRateMenu(slot)
+            self.applyTitle(slot)
+            // NDI receivers clock off the declared rate, so it has to track the real one.
+            self.ndiLock.lock(); let sink = self.ndi[slot]; self.ndiLock.unlock()
+            sink?.setDeclaredFrameRate(Int32(st.current))
+            NSLog("EpocCam[%@]: streaming at %d fps (60fps capable: %@)",
+                  slot.label, st.current, st.supports60 ? "yes" : "no")
+        }
+        browser.onFocusState = { [weak self] slot, st in
+            guard let self else { return }
+            self.focusStates[slot] = st
+            self.applyFocusAppearance(slot)
+        }
+        browser.onBattery = { [weak self] slot, level, charging in
+            guard let self else { return }
+            self.batteryStates[slot] = (level, charging)
+            self.applyTitle(slot)
+        }
+        browser.onFrame = { [weak self] slot, pixelBuffer in
+            guard let self else { return }
+            self.recordFrame(slot)
+            // Dispatched unconditionally on purpose: isHidden is AppKit state and must not
+            // be read off the main thread just to save a dispatch.
+            DispatchQueue.main.async {
+                if let overlay = self.statusOverlays[slot], overlay.isHidden == false {
+                    overlay.isHidden = true
+                }
+            }
+            self.videoViews[slot]?.display(pixelBuffer: pixelBuffer)
+            self.syphon[slot]?.publishPixelBuffer(pixelBuffer)
+            self.lastFrameSize[slot] = (CVPixelBufferGetWidth(pixelBuffer),
+                                        CVPixelBufferGetHeight(pixelBuffer))
+            // Last, and off-thread: Syphon and the preview never wait on NDI. Skipped in
+            // passthrough mode, where compressed frames feed NDI instead.
+            if !self.ndiPassthrough { self.publishNDI(slot, pixelBuffer) }
+        }
+        browser.start()
+    }
+}
